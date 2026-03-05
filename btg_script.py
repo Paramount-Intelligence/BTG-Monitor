@@ -472,9 +472,12 @@ def extract_project_data(card):
         except Exception:
             pass
 
+        description = _first_text(card, DESCRIPTION_SELECTORS, 500)
+
         return {
             "id":          project_id,
             "title":       title,
+            "description": description,
             "location":    location,
             "budget":      budget,
             "duration":    duration,
@@ -622,17 +625,22 @@ def insert_project(project, emailed=True):
     """Upsert one project record. Silently skips if ID already exists."""
     try:
         doc = {
-            "id":          project.get("id"),
-            "title":       project.get("title"),
-            "location":    project.get("location"),
-            "budget":      project.get("budget"),
-            "duration":    project.get("duration"),
-            "time_posted": project.get("time_posted"),
-            "status":      project.get("status"),
-            "url":         project.get("url"),
-            "detected_at": project.get("detected_at"),
-            "platform":    "btg",
-            "emailed":     bool(emailed),
+            "id":           project.get("id"),
+            "title":        project.get("title"),
+            "description":  project.get("description"),
+            "location":     project.get("location"),
+            "budget":       project.get("budget"),
+            "duration":     project.get("duration"),
+            "start_date":   project.get("start_date"),
+            "project_length": project.get("project_length"),
+            "level_of_support": project.get("level_of_support"),
+            "industry":     project.get("industry"),
+            "time_posted":  project.get("time_posted"),
+            "status":       project.get("status"),
+            "url":          project.get("url"),
+            "detected_at":  project.get("detected_at"),
+            "platform":     "btg",
+            "emailed":      bool(emailed),
         }
         _get_collection().update_one(
             {"id": doc["id"]},
@@ -772,103 +780,237 @@ def format_posted_display(time_str):
     # Relative string — return as-is
     return s
 
+
+def fetch_project_details(driver, url):
+    """Navigate to a BTG project detail page and extract full information."""
+    details = {}
+    try:
+        driver.get(url)
+        time.sleep(4)
+
+        # Try CSS selectors for full description
+        for sel in [".description", ".project-description", "[class*='description']",
+                    ".overview", ".project-overview", ".summary", "[class*='overview']"]:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                t = el.text.strip()
+                if len(t) > 50:
+                    details["description"] = t
+                    break
+            except Exception:
+                pass
+
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+
+        # Fallback: extract description block from body text
+        if not details.get("description"):
+            m = re.search(
+                r'(?:Description|Overview|Summary)\s*\n([\s\S]+?)(?=\n(?:Project Details|Budget|Location|Requirements|Qualifications|Apply|Start Date)|\Z)',
+                body_text, re.IGNORECASE
+            )
+            if m:
+                txt = m.group(1).strip()
+                if len(txt) > 50:
+                    details["description"] = txt
+
+        # Extract structured fields
+        patterns = {
+            "start_date":       r'(?:Start Date|Starts|Start:)\s*[:\n]\s*([^\n]{2,60})',
+            "project_length":   r'(?:Duration|Project Length|Expected Length)\s*[:\n]\s*([^\n]{2,60})',
+            "timeline":         r'Timeline\s*\n([^\n]{5,80})',
+            "engagement_type":  r'(?:Full time|Part time|Fractional)',
+            "level_of_support": r'Level of Support\s*[:\n]\s*([^\n]{2,60})',
+            "industry":         r'(?:Industry|Desired Industry Background)\s*[:\n]\s*([^\n]{2,100})',
+            "detail_budget":    r'(?:Budget)\s*\n\s*(\$[^\n]{2,80})',
+            "deadline":         r'Deadline\s*[:\n]\s*([^\n]{2,30})',
+            "location_type":    r'(On-site|Remote|Hybrid)',
+        }
+        for field, pattern in patterns.items():
+            m = re.search(pattern, body_text, re.IGNORECASE)
+            if m:
+                val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                if val:
+                    details[field] = val
+
+        # Extract Requirements as a bullet list
+        req_match = re.search(
+            r'Requirements?\s*\n([\s\S]+?)(?=\n(?:Budget|Apply|Deadline|Not for you|\Z))',
+            body_text, re.IGNORECASE
+        )
+        if req_match:
+            lines = [l.strip() for l in req_match.group(1).splitlines() if l.strip()]
+            if lines:
+                details["requirements"] = lines
+
+    except Exception as e:
+        print(f"  ⚠️ Detail fetch failed: {e}")
+    return details
+
+
+def _esc(text):
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _section_header(icon, title, color):
+    return (
+        f'<tr><td colspan="2" style="padding:14px 16px 6px;background:{color};'
+        f'color:#fff;font-size:12px;font-weight:bold;'
+        f'text-transform:uppercase;letter-spacing:1px;">'
+        f'{icon}&nbsp; {title}</td></tr>'
+    )
+
+
+def _row(label, value, alt=False, bold_value=False):
+    if not value:
+        return ""
+    bg   = "background:#f8f9fa;" if alt else "background:#fff;"
+    bold = "font-weight:bold;" if bold_value else ""
+    return (
+        f"<tr>"
+        f"<td style='padding:9px 16px;color:#555;width:200px;{bg}border-bottom:1px solid #eee;'>"
+        f"<strong>{_esc(label)}</strong></td>"
+        f"<td style='padding:9px 16px;{bg}{bold}border-bottom:1px solid #eee;'>{_esc(str(value))}</td>"
+        f"</tr>"
+    )
+
+
 def create_email_html(project):
-    """Build the HTML email body for a BTG project alert."""
-    status      = project.get("status", "Posted")
-    location    = project.get("location", "") or "Remote / Not specified"
-    time_posted = project.get("time_posted", "Unknown")
-    time_posted_display = format_posted_display(time_posted)
-    budget      = project.get("budget", "")
-    duration    = project.get("duration", "")
-    url         = project.get("url", Config.PROJECTS_URL)
-    detected_at = project.get("detected_at", "")
-    project_id  = project.get("id", "N/A")
-    title       = project.get("title", "Untitled Project")
+    title           = project.get("title", "Untitled Project")
+    url             = project.get("url", Config.PROJECTS_URL)
+    time_posted     = project.get("time_posted", "")
+    status          = project.get("status", "")
+    detected_at     = project.get("detected_at", "")
+    project_id      = project.get("id", "")
+    description     = project.get("description", "")
+    location        = project.get("location", "") or "Remote / Not specified"
+    location_type   = project.get("location_type", "")
+    start_date      = project.get("start_date", "")
+    timeline        = project.get("timeline", "")
+    proj_length     = project.get("project_length", "") or project.get("duration", "")
+    engagement_type = project.get("engagement_type", "")
+    deadline        = project.get("deadline", "")
+    budget          = project.get("budget", "") or project.get("detail_budget", "") or "Not provided"
+    support_level   = project.get("level_of_support", "")
+    industry        = project.get("industry", "")
+    requirements    = project.get("requirements", [])  # list of strings
 
-    status_badge = (
-        "<span style='background:#e74c3c;color:white;padding:4px 10px;border-radius:3px;"
-        "font-size:12px;font-weight:bold;'>🆕 New Project</span>"
-        if status == "New Project" else ""
+    hdr_grad   = "linear-gradient(135deg,#0e7490,#06b6d4)"
+    sec_desc   = "#0e7490"
+    sec_detail = "#155e75"
+    sec_req    = "#1d4ed8"
+    sec_budget = "#7c3aed"
+    sec_meta   = "#6b7280"
+    btn_color  = "#06b6d4"
+
+    badge = ""
+    if status == "New Project":
+        badge = ("<span style='display:inline-block;background:#e74c3c;color:#fff;"
+                 "padding:4px 12px;border-radius:3px;font-size:12px;font-weight:bold;"
+                 "margin-bottom:12px;'>🆕 New Project</span>")
+
+    # Description section
+    desc_section = ""
+    if description:
+        paragraphs = _esc(description).replace("\n\n", "|||").replace("\n", " ")
+        paras = [f"<p style='margin:0 0 10px;'>{p}</p>" for p in paragraphs.split("|||")]
+        desc_section = (
+            _section_header('📋', 'Description', sec_desc) +
+            f"<tr><td colspan='2' style='padding:14px 16px;background:#f9fafb;"
+            f"font-size:14px;line-height:1.75;color:#333;border-bottom:2px solid #e5e7eb;'>"
+            f"{''.join(paras)}</td></tr>"
+        )
+
+    # Project Details section
+    # Build timeline display: prefer explicit timeline, fall back to start_date
+    timeline_display = timeline or start_date or "TBD"
+    if proj_length and proj_length not in timeline_display:
+        timeline_display += f"  ({proj_length})"
+    loc_display = location
+    if location_type and location_type.lower() not in location.lower():
+        loc_display += f" — {location_type}"
+
+    detail_rows = (
+        _row("Location",    loc_display,                                     alt=False) +
+        _row("Timeline",    timeline_display,                                alt=True) +
+        _row("Engagement",  engagement_type or "Not specified",              alt=False) +
+        _row("Deadline",    deadline,                                        alt=True)
+    )
+    detail_section = _section_header('📦', 'Project Details', sec_detail) + detail_rows
+
+    # Requirements section (bullet list)
+    req_section = ""
+    if requirements:
+        items = "".join(
+            f"<li style='margin-bottom:6px;'>{_esc(r)}</li>" for r in requirements
+        )
+        req_section = (
+            _section_header('✅', 'Requirements', sec_req) +
+            f"<tr><td colspan='2' style='padding:14px 16px;background:#f8f9fa;"
+            f"font-size:14px;line-height:1.6;color:#333;border-bottom:2px solid #e5e7eb;'>"
+            f"<ul style='margin:0;padding-left:20px;'>{items}</ul></td></tr>"
+        )
+
+    # Budget section
+    budget_section = (
+        _section_header('💰', 'Budget', sec_budget) +
+        _row("Rate / Budget", budget, bold_value=bool(project.get("budget") or project.get("detail_budget")))
+    )
+    if support_level or industry:
+        budget_section += (
+            _row("Level of Support", support_level or "Not specified", alt=True) +
+            _row("Industry",         industry       or "Not specified", alt=False)
+        )
+
+    # Detection meta
+    time_posted_display = format_posted_display(time_posted) if time_posted else "—"
+    meta_rows = (
+        _row("Posted",      time_posted_display,  alt=False) +
+        _row("Detected at", detected_at,          alt=True) +
+        _row("Project ID",  project_id,           alt=False)
     )
 
-    budget_row = (
-        f"<tr><td style='padding:6px 10px;color:#555;width:160px;'>💰 <strong>Budget / Rate</strong></td>"
-        f"<td style='padding:6px 10px;color:#0e7490;font-weight:bold;'>{budget}</td></tr>"
-        if budget else ""
-    )
-    duration_row = (
-        f"<tr><td style='padding:6px 10px;color:#555;'>⏱️ <strong>Duration</strong></td>"
-        f"<td style='padding:6px 10px;'>{duration}</td></tr>"
-        if duration else ""
-    )
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:Arial,Helvetica,sans-serif;color:#333;">
+  <div style="max-width:700px;margin:30px auto;background:#fff;border-radius:10px;
+       overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.12);">
 
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="utf-8"></head>
-    <body style="margin:0;padding:0;background:#f0f2f5;font-family:Arial,sans-serif;color:#333;">
-        <div style="max-width:680px;margin:30px auto;background:#fff;border-radius:8px;
-                    overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.12);">
+    <div style="background:{hdr_grad};padding:24px 28px;">
+      <p style="margin:0;color:rgba(255,255,255,0.75);font-size:11px;
+          letter-spacing:1.5px;text-transform:uppercase;">BTG Project Monitor</p>
+      <h2 style="margin:6px 0 0;color:#fff;font-size:24px;font-weight:700;">🚀 New BTG Project Alert</h2>
+    </div>
 
-            <!-- Header — BTG teal -->
-            <div style="background:linear-gradient(135deg,#0e7490,#06b6d4);padding:22px 28px;">
-                <p style="margin:0;color:rgba(255,255,255,0.8);font-size:13px;
-                          letter-spacing:1px;text-transform:uppercase;">BTG Project Monitor</p>
-                <h2 style="margin:6px 0 0;color:#fff;font-size:20px;">🚀 New BTG Project Alert</h2>
-            </div>
+    <div style="padding:22px 28px 4px;">
+      <h3 style="margin:0 0 10px;color:#1a252f;font-size:20px;line-height:1.4;">{_esc(title)}</h3>
+      {badge}
+    </div>
 
-            <!-- Body -->
-            <div style="padding:24px 28px;">
+    <div style="padding:0 28px 28px;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;
+             border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+        {desc_section}
+        {detail_section}
+        {req_section}
+        {budget_section}
+        {_section_header('🕒', 'Detection Info', sec_meta)}
+        {meta_rows}
+      </table>
+      <div style="text-align:center;margin-top:28px;">
+        <a href="{url}" style="display:inline-block;background:{btn_color};color:#fff;
+                  padding:14px 36px;text-decoration:none;border-radius:6px;
+                  font-weight:bold;font-size:15px;letter-spacing:0.3px;">
+          View Full Project on BTG →
+        </a>
+      </div>
+    </div>
 
-                <!-- Title + badge -->
-                <h3 style="margin:0 0 10px;color:#1a252f;font-size:18px;line-height:1.4;">{title}</h3>
-                {status_badge}
-
-                <!-- Key info table -->
-                <div style="margin:18px 0;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
-                    <table style="width:100%;border-collapse:collapse;font-size:14px;">
-                        <tr style="background:#f8f9fa;">
-                            <td style="padding:6px 10px;color:#555;width:160px;">📍 <strong>Location</strong></td>
-                            <td style="padding:6px 10px;">{location}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding:6px 10px;color:#555;">⏰ <strong>Posted</strong></td>
-                            <td style="padding:6px 10px;">{time_posted_display}</td>
-                        </tr>
-                        {budget_row}
-                        {duration_row}
-                        <tr style="background:#f8f9fa;">
-                            <td style="padding:6px 10px;color:#555;">🕒 <strong>Detected at</strong></td>
-                            <td style="padding:6px 10px;">{detected_at}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding:6px 10px;color:#555;">🆔 <strong>Project ID</strong></td>
-                            <td style="padding:6px 10px;font-family:monospace;
-                                       font-size:13px;color:#888;">{project_id}</td>
-                        </tr>
-                    </table>
-                </div>
-
-                <!-- CTA -->
-                <div style="text-align:center;margin-top:22px;">
-                    <a href="{url}"
-                       style="display:inline-block;background:#06b6d4;color:#fff;
-                              padding:13px 32px;text-decoration:none;border-radius:6px;
-                              font-weight:bold;font-size:15px;">
-                        View on BTG Dashboard →
-                    </a>
-                </div>
-            </div>
-
-            <!-- Footer -->
-            <div style="background:#f8f9fa;padding:14px 28px;border-top:1px solid #eee;
-                        font-size:12px;color:#999;text-align:center;">
-                BTG Project Monitor &nbsp;|&nbsp; Auto-notification &nbsp;|&nbsp; {detected_at}
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    <div style="background:#f8f9fa;padding:14px 28px;border-top:1px solid #eee;
+         font-size:12px;color:#999;text-align:center;">
+      BTG Project Monitor &nbsp;|&nbsp; Automated alert &nbsp;|&nbsp; {detected_at}
+    </div>
+  </div>
+</body></html>"""
 
 
 def send_notification(project):
@@ -993,7 +1135,7 @@ def main():
             print(f"🔄 Check #{check_count} — {datetime.now(PKT).strftime('%H:%M:%S')} PKT")
             print(f"{'='*30}")
 
-            driver.refresh()
+            driver.get(Config.PROJECTS_URL)
             time.sleep(5)
 
             all_projects = scan_for_projects(driver)
@@ -1018,6 +1160,9 @@ def main():
                 print(f"🎯 Found {len(new_projects)} NEW project(s)!")
                 for project in new_projects:
                     print(f"  → {project['title'][:60]}...")
+                    print(f"     Fetching full project details...")
+                    details = fetch_project_details(driver, project['url'])
+                    project.update(details)
                     emailed = send_notification(project)
                     if not TEST_MODE:
                         insert_project(project, emailed=emailed)
