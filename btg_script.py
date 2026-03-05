@@ -801,6 +801,8 @@ def fetch_project_details(driver, url):
                 pass
 
         body_text = driver.find_element(By.TAG_NAME, "body").text
+        # Normalize non-breaking spaces and Windows line endings
+        body_text = body_text.replace('\u00a0', ' ').replace('\r\n', '\n').replace('\r', '\n')
 
         # Fallback: extract description block from body text
         if not details.get("description"):
@@ -813,16 +815,20 @@ def fetch_project_details(driver, url):
                 if len(txt) > 50:
                     details["description"] = txt
 
-        # Extract structured fields
+        # Extract structured fields.
+        # _SEP matches label→value separator in two formats:
+        #   • same-line: "Timeline    6 months"  (spaces/tabs only)
+        #   • next-line:  "Timeline\n6 months"   (newline, optional blank lines)
+        _SEP = r'(?:[ \t]+|[ \t]*\n(?:[ \t]*\n)*[ \t]*)'
         patterns = {
-            "start_date":       r'(?:Start Date|Starts|Start:)\s*[:\n]\s*([^\n]{2,60})',
-            "project_length":   r'(?:Duration|Project Length|Expected Length)\s*[:\n]\s*([^\n]{2,60})',
-            "timeline":         r'Timeline\s*\n([^\n]{5,80})',
+            "start_date":       rf'(?:Start Date|Starts|Start:){_SEP}([^\n]{{2,60}})',
+            "project_length":   rf'(?:Duration|Project Length|Expected Length){_SEP}([^\n]{{2,60}})',
+            "timeline":         rf'Timeline{_SEP}([^\n]{{5,80}})',
             "engagement_type":  r'(?:Full time|Part time|Fractional)',
-            "level_of_support": r'Level of Support\s*[:\n]\s*([^\n]{2,60})',
-            "industry":         r'(?:Industry|Desired Industry Background)\s*[:\n]\s*([^\n]{2,100})',
-            "detail_budget":    r'(?:Budget)\s*\n\s*(\$[^\n]{2,80})',
-            "deadline":         r'Deadline\s*[:\n]\s*([^\n]{2,30})',
+            "level_of_support": rf'Level of Support{_SEP}([^\n]{{2,60}})',
+            "industry":         rf'(?:Industry|Desired Industry Background){_SEP}([^\n]{{2,100}})',
+            "detail_budget":    rf'(?:Budget){_SEP}(\$[^\n]{{2,80}})',
+            "deadline":         rf'Deadline{_SEP}([^\n]{{2,30}})',
             "location_type":    r'(On-site|Remote|Hybrid)',
         }
         for field, pattern in patterns.items():
