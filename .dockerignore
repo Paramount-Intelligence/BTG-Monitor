@@ -1,0 +1,10 @@
+.env
+_.env
+.git
+.github
+.gitignore
+btg_cookies.json
+**pycache**/
+_.pyc
+\*.pyo
+README.md

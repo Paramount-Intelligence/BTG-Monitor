@@ -1,0 +1,7 @@
+.env
+*.env
+btg_cookies.json
+__pycache__/
+*.pyc
+*.pyo
+test_output.txt

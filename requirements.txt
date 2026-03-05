@@ -1,0 +1,9 @@
+# Selenium for web automation
+selenium>=4.15.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# MongoDB driver (Atlas cloud DB)
+pymongo>=4.0.0
+dnspython>=2.0.0
