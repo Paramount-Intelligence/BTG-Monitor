@@ -1,6 +1,9 @@
 # Selenium for web automation
 selenium>=4.15.0
 
+# Automatic chromedriver management (handles version mismatches in containers)
+webdriver-manager>=4.0.0
+
 # Environment variable management
 python-dotenv>=1.0.0
 

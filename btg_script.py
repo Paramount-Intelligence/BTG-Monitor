@@ -1081,14 +1081,27 @@ def initialize_driver():
         print(f"  Chrome binary: {chrome_bin}")
 
     from selenium.webdriver.chrome.service import Service
-    chromedriver_path = _find_binary("CHROMEDRIVER_PATH", [
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ])
-    service = Service(chromedriver_path) if chromedriver_path else Service()
-    if chromedriver_path:
-        print(f"  Chromedriver: {chromedriver_path}")
+    service = None
+
+    # Primary: webdriver-manager downloads a chromedriver that matches the installed browser
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        from webdriver_manager.core.os_manager import ChromeType
+        is_chromium = "chromium" in (chrome_bin or "").lower()
+        mgr = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM if is_chromium else ChromeType.GOOGLE)
+        driver_path = mgr.install()
+        service = Service(driver_path)
+        print(f"  Chromedriver (webdriver-manager): {driver_path}")
+    except Exception as e:
+        print(f"  webdriver-manager failed ({e}), falling back to system chromedriver")
+        system_path = _find_binary("CHROMEDRIVER_PATH", [
+            "/usr/bin/chromedriver",
+            "/usr/lib/chromium/chromedriver",
+            "/usr/lib/chromium-browser/chromedriver",
+        ])
+        service = Service(system_path) if system_path else Service()
+        if system_path:
+            print(f"  Chromedriver (system): {system_path}")
 
     driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd("Network.setUserAgentOverride", {
