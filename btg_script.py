@@ -1056,7 +1056,16 @@ def initialize_driver():
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
-    driver = webdriver.Chrome(options=options)
+    # Use Chromium binary when running in a container (set via CHROME_BIN env var)
+    chrome_bin = os.getenv("CHROME_BIN", "")
+    if chrome_bin and os.path.exists(chrome_bin):
+        options.binary_location = chrome_bin
+
+    from selenium.webdriver.chrome.service import Service
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "")
+    service = Service(chromedriver_path) if chromedriver_path and os.path.exists(chromedriver_path) else Service()
+
+    driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd("Network.setUserAgentOverride", {
         "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     })
