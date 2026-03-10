@@ -128,22 +128,58 @@ def dump_page_structure(driver):
 # ============================
 # SESSION MANAGEMENT
 # ============================
+def _get_session_collection():
+    """Separate MongoDB collection for storing session cookies."""
+    global _mongo_client
+    if _mongo_client is None:
+        _mongo_client = MongoClient(Config.MONGO_URI)
+    return _mongo_client["office_monitor"]["btg_session"]
+
 def save_cookies(driver):
+    """Save cookies to MongoDB (survives container restarts) AND local file as backup."""
+    cookies = driver.get_cookies()
+    # MongoDB
+    try:
+        _get_session_collection().update_one(
+            {"_id": "btg_cookies"},
+            {"$set": {"cookies": cookies, "saved_at": datetime.now(timezone.utc)}},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"  ⚠️ Could not save cookies to MongoDB: {e}")
+    # Local file fallback
     try:
         path = os.path.join(os.path.dirname(__file__), Config.COOKIES_FILE)
         with open(path, 'w') as f:
-            json.dump(driver.get_cookies(), f)
-        return True
+            json.dump(cookies, f)
     except Exception:
-        return False
+        pass
+    return True
 
 def load_cookies(driver):
-    path = os.path.join(os.path.dirname(__file__), Config.COOKIES_FILE)
-    if not os.path.exists(path):
+    """Load cookies from MongoDB first, fall back to local file."""
+    cookies = None
+    # Try MongoDB first
+    try:
+        doc = _get_session_collection().find_one({"_id": "btg_cookies"})
+        if doc and doc.get("cookies"):
+            cookies = doc["cookies"]
+            print("  Loaded cookies from MongoDB")
+    except Exception as e:
+        print(f"  ⚠️ Could not load cookies from MongoDB: {e}")
+    # Fall back to local file
+    if not cookies:
+        path = os.path.join(os.path.dirname(__file__), Config.COOKIES_FILE)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    cookies = json.load(f)
+                print("  Loaded cookies from local file")
+            except Exception:
+                pass
+    if not cookies:
         return False
     try:
-        with open(path, 'r') as f:
-            cookies = json.load(f)
         driver.get(Config.BASE_URL)
         time.sleep(2)
         driver.delete_all_cookies()
@@ -1183,12 +1219,20 @@ def main():
             # ─────────────────────────────────────────────────────────────────────
 
         check_count = 0
+        last_keepalive = time.time()
+        KEEPALIVE_INTERVAL = 1800  # refresh session every 30 minutes
         while True:
           try:
             check_count += 1
             print(f"\n{'='*30}")
             print(f"🔄 Check #{check_count} — {datetime.now(PKT).strftime('%H:%M:%S')} PKT")
             print(f"{'='*30}")
+
+            # Keep-alive: re-save cookies every 30 min to reset expiry in MongoDB
+            if time.time() - last_keepalive > KEEPALIVE_INTERVAL:
+                save_cookies(driver)
+                last_keepalive = time.time()
+                print("  🔁 Session keep-alive: cookies refreshed")
 
             driver.get(Config.PROJECTS_URL)
             time.sleep(5)
