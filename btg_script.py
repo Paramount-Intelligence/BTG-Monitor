@@ -1081,27 +1081,29 @@ def initialize_driver():
         print(f"  Chrome binary: {chrome_bin}")
 
     from selenium.webdriver.chrome.service import Service
-    service = None
 
-    # Primary: webdriver-manager downloads a chromedriver that matches the installed browser
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        from webdriver_manager.core.os_manager import ChromeType
-        is_chromium = "chromium" in (chrome_bin or "").lower()
-        mgr = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM if is_chromium else ChromeType.GOOGLE)
-        driver_path = mgr.install()
-        service = Service(driver_path)
-        print(f"  Chromedriver (webdriver-manager): {driver_path}")
-    except Exception as e:
-        print(f"  webdriver-manager failed ({e}), falling back to system chromedriver")
-        system_path = _find_binary("CHROMEDRIVER_PATH", [
-            "/usr/bin/chromedriver",
-            "/usr/lib/chromium/chromedriver",
-            "/usr/lib/chromium-browser/chromedriver",
-        ])
-        service = Service(system_path) if system_path else Service()
-        if system_path:
-            print(f"  Chromedriver (system): {system_path}")
+    # Primary: system chromedriver — apt installs chromium-driver version-matched to chromium
+    system_path = _find_binary("CHROMEDRIVER_PATH", [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ])
+    if system_path:
+        service = Service(system_path)
+        print(f"  Chromedriver (system): {system_path}")
+    else:
+        # Fallback: webdriver-manager (downloads matching chromedriver)
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from webdriver_manager.core.os_manager import ChromeType
+            is_chromium = "chromium" in (chrome_bin or "").lower()
+            mgr = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM if is_chromium else ChromeType.GOOGLE)
+            driver_path = mgr.install()
+            service = Service(driver_path)
+            print(f"  Chromedriver (webdriver-manager): {driver_path}")
+        except Exception as e:
+            print(f"  Using default Service(): {e}")
+            service = Service()
 
     driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd("Network.setUserAgentOverride", {
@@ -1190,6 +1192,16 @@ def main():
 
             driver.get(Config.PROJECTS_URL)
             time.sleep(5)
+
+            # If session expired, BTG silently redirects to /login — re-login immediately
+            if "login" in driver.current_url.lower() or "sign" in driver.current_url.lower():
+                print("  ⚠️ Session expired — re-logging in...")
+                if not perform_login(driver):
+                    print("  ❌ Re-login failed — skipping cycle")
+                    time.sleep(Config.CHECK_INTERVAL)
+                    continue
+                driver.get(Config.PROJECTS_URL)
+                time.sleep(5)
 
             all_projects = scan_for_projects(driver)
 
