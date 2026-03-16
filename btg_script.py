@@ -133,7 +133,7 @@ def _get_session_collection():
     global _mongo_client
     if _mongo_client is None:
         _mongo_client = MongoClient(Config.MONGO_URI)
-    return _mongo_client["office_monitor"]["btg_session"]
+    return _mongo_client["office_monitor"]["sessions"]
 
 def save_cookies(driver):
     """Save cookies to MongoDB (survives container restarts) AND local file as backup."""
@@ -636,12 +636,12 @@ def _get_collection():
     global _mongo_client
     if _mongo_client is None:
         _mongo_client = MongoClient(Config.MONGO_URI)
-    return _mongo_client["office_monitor"]["btg_projects"]
+    return _mongo_client["office_monitor"]["projects"]
 
 def init_db():
-    """Ensure a unique index on 'id' exists (no-op if already created by setup_mongo.py)."""
+    """Ensure a unique index on 'project_id' exists."""
     try:
-        _get_collection().create_index("id", unique=True, name="idx_id_unique")
+        _get_collection().create_index("project_id", unique=True, name="idx_project_id_unique")
     except Exception:
         pass  # Index already exists — safe to ignore
 
@@ -652,8 +652,8 @@ def db_is_cold_start():
 def get_seen_ids():
     """Return set of all project IDs already in DB."""
     try:
-        docs = _get_collection().find({}, {"id": 1, "_id": 0})
-        return {d["id"] for d in docs}
+        docs = _get_collection().find({}, {"project_id": 1, "_id": 0})
+        return {d["project_id"] for d in docs if d.get("project_id")}
     except Exception:
         return set()
 
@@ -661,25 +661,25 @@ def insert_project(project, emailed=True):
     """Upsert one project record. Silently skips if ID already exists."""
     try:
         doc = {
-            "id":           project.get("id"),
-            "title":        project.get("title"),
-            "description":  project.get("description"),
-            "location":     project.get("location"),
-            "budget":       project.get("budget"),
-            "duration":     project.get("duration"),
-            "start_date":   project.get("start_date"),
-            "project_length": project.get("project_length"),
+            "project_id":       project.get("id"),
+            "title":            project.get("title"),
+            "description":      project.get("description"),
+            "location":         project.get("location"),
+            "budget":           project.get("budget"),
+            "duration":         project.get("duration"),
+            "start_date":       project.get("start_date"),
+            "project_length":   project.get("project_length"),
             "level_of_support": project.get("level_of_support"),
-            "industry":     project.get("industry"),
-            "time_posted":  project.get("time_posted"),
-            "status":       project.get("status"),
-            "url":          project.get("url"),
-            "detected_at":  project.get("detected_at"),
-            "platform":     "btg",
-            "emailed":      bool(emailed),
+            "industry":         project.get("industry"),
+            "time_posted":      project.get("time_posted"),
+            "status":           project.get("status"),
+            "url":              project.get("url"),
+            "detected_at":      project.get("detected_at"),
+            "platform":         "btg",
+            "emailed":          bool(emailed),
         }
         _get_collection().update_one(
-            {"id": doc["id"]},
+            {"project_id": doc["project_id"]},
             {"$setOnInsert": doc},
             upsert=True,
         )
@@ -694,7 +694,7 @@ def bulk_insert_projects(projects, emailed=False):
             if not p.get("id"):
                 continue
             doc = {
-                "id":          p.get("id"),
+                "project_id":  p.get("id"),
                 "title":       p.get("title"),
                 "location":    p.get("location"),
                 "budget":      p.get("budget"),
@@ -706,7 +706,7 @@ def bulk_insert_projects(projects, emailed=False):
                 "platform":    "btg",
                 "emailed":     bool(emailed),
             }
-            ops.append(UpdateOne({"id": doc["id"]}, {"$setOnInsert": doc}, upsert=True))
+            ops.append(UpdateOne({"project_id": doc["project_id"]}, {"$setOnInsert": doc}, upsert=True))
         if ops:
             result = _get_collection().bulk_write(ops, ordered=False)
             print(f"  DB: inserted {result.upserted_count} records (emailed={'yes' if emailed else 'no'})")
