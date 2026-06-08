@@ -34,7 +34,7 @@ class Config:
     RECIPIENT_EMAILS = [
         e.strip() for e in
         os.getenv("RECIPIENT_EMAILS",
-                  "ahmedghazi495@gmail.com,ahsanuddin3522@gmail.com,muhammad.abdullahds1@gmail.com")
+                  "ahmedghazi495@gmail.com,ahsanuddin3522@gmail.com")
         .split(",") if e.strip()
     ]
     CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", 60))
@@ -1178,8 +1178,8 @@ def main():
     print()
 
     if TEST_MODE:
-        Config.RECIPIENT_EMAILS = ["muhammad.abdullahds1@gmail.com"]
-        print("🧪 TEST MODE — MongoDB skipped, 1 test email → muhammad.abdullahds1@gmail.com\n")
+        Config.RECIPIENT_EMAILS = ["muhammadammar7747@gmail.com"]
+        print("🧪 TEST MODE — MongoDB skipped, 1 test email → muhammadammar7747@gmail.com\n")
 
     driver = initialize_driver()
 
