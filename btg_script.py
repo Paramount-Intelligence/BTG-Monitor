@@ -824,6 +824,42 @@ def fetch_project_details(driver, url):
         driver.get(url)
         time.sleep(4)
 
+        # --- Click any "Read more" / "Show more" / expand buttons to reveal full text ---
+        for btn_sel in [
+            "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'read more')]",
+            "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
+            "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'read more')]",
+            "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
+            "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'see more')]",
+            "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'view more')]",
+            "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'view full')]",
+        ]:
+            try:
+                btn = driver.find_element(By.XPATH, btn_sel)
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(2)
+                    print(f"  Clicked expand button to reveal full description")
+                    break
+            except:
+                continue
+
+        # --- Also remove CSS truncation via JavaScript ---
+        try:
+            driver.execute_script("""
+                document.querySelectorAll('[class*="description"], [class*="overview"], [class*="summary"]')
+                    .forEach(function(el) {
+                        el.style.maxHeight = 'none';
+                        el.style.overflow = 'visible';
+                        el.style.textOverflow = 'unset';
+                        el.style.webkitLineClamp = 'unset';
+                        el.style.display = 'block';
+                    });
+            """)
+            time.sleep(1)
+        except:
+            pass
+
         # Try CSS selectors for full description
         for sel in [".description", ".project-description", "[class*='description']",
                     ".overview", ".project-overview", ".summary", "[class*='overview']"]:
@@ -836,19 +872,40 @@ def fetch_project_details(driver, url):
             except Exception:
                 pass
 
+        # If CSS-extracted text still looks truncated (ends with "..."), try JS innerText
+        if details.get("description", "").rstrip().endswith("..."):
+            try:
+                full_text = driver.execute_script("""
+                    var candidates = document.querySelectorAll(
+                        '[class*="description"], [class*="overview"], [class*="summary"]'
+                    );
+                    var best = '';
+                    for (var i = 0; i < candidates.length; i++) {
+                        var t = candidates[i].innerText || '';
+                        if (t.length > best.length && t.length > 50) best = t;
+                    }
+                    return best.trim();
+                """) or ""
+                if full_text and len(full_text) > len(details.get("description", "")):
+                    details["description"] = full_text
+            except:
+                pass
+
         body_text = driver.find_element(By.TAG_NAME, "body").text
         # Normalize non-breaking spaces and Windows line endings
         body_text = body_text.replace('\u00a0', ' ').replace('\r\n', '\n').replace('\r', '\n')
 
         # Fallback: extract description block from body text
-        if not details.get("description"):
+        # Also override if existing description looks truncated (ends with "...")
+        existing_desc = details.get("description", "")
+        if not existing_desc or existing_desc.rstrip().endswith("..."):
             m = re.search(
-                r'(?:Description|Overview|Summary)\s*\n([\s\S]+?)(?=\n(?:Project Details|Budget|Location|Requirements|Qualifications|Apply|Start Date)|\Z)',
+                r'(?:Description|Overview|Summary)\s*\n([\s\S]+?)(?=\n(?:Project Details|Budget|Location|Requirements|Qualifications|Apply|Start Date|Timeline|Deadline)|\Z)',
                 body_text, re.IGNORECASE
             )
             if m:
                 txt = m.group(1).strip()
-                if len(txt) > 50:
+                if len(txt) > len(existing_desc):
                     details["description"] = txt
 
         # Extract structured fields.
