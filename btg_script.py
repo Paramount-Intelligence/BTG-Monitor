@@ -860,7 +860,7 @@ def fetch_project_details(driver, url):
         except:
             pass
 
-        # Try CSS selectors for full description
+        # Try CSS selectors for full description (avoid broad page containers)
         for sel in [".description", ".project-description", "[class*='description']",
                     ".overview", ".project-overview", ".summary", "[class*='overview']"]:
             try:
@@ -895,8 +895,20 @@ def fetch_project_details(driver, url):
         # Normalize non-breaking spaces and Windows line endings
         body_text = body_text.replace('\u00a0', ' ').replace('\r\n', '\n').replace('\r', '\n')
 
-        # Fallback: extract description block from body text
-        # Also override if existing description looks truncated (ends with "...")
+        # Primary extraction: BTG detail pages have no "Description" heading.
+        # The description sits between the title/location header and "Apply Now".
+        existing_desc = details.get("description", "")
+        if not existing_desc or existing_desc.rstrip().endswith("...") or len(existing_desc) < 100:
+            m = re.search(
+                r'date_range\s+[^\n]+\n([\s\S]+?)(?=\n(?:add\n)?Apply Now|\nDeadline:|\nNot for you)',
+                body_text, re.IGNORECASE
+            )
+            if m:
+                txt = m.group(1).strip()
+                if len(txt) > len(existing_desc):
+                    details["description"] = txt
+
+        # Fallback: extract description via labeled heading (other BTG layouts)
         existing_desc = details.get("description", "")
         if not existing_desc or existing_desc.rstrip().endswith("..."):
             m = re.search(
@@ -908,20 +920,32 @@ def fetch_project_details(driver, url):
                 if len(txt) > len(existing_desc):
                     details["description"] = txt
 
+        # Clean material icon text and nav cruft from description
+        if details.get("description"):
+            ICON_NAMES = {"savings", "place", "insert_invitation", "schedule",
+                          "location_on", "attach_money", "event", "timer",
+                          "work", "business", "person", "star", "info",
+                          "person_pin_circle", "date_range", "watch_later",
+                          "home_work_filled", "expand_more", "add"}
+            lines = details["description"].splitlines()
+            cleaned = [l.strip() for l in lines
+                       if l.strip() and l.strip().lower() not in ICON_NAMES]
+            details["description"] = "\n".join(cleaned)
+
         # Extract structured fields.
         # _SEP matches label→value separator in two formats:
         #   • same-line: "Timeline    6 months"  (spaces/tabs only)
         #   • next-line:  "Timeline\n6 months"   (newline, optional blank lines)
         _SEP = r'(?:[ \t]+|[ \t]*\n(?:[ \t]*\n)*[ \t]*)'
         patterns = {
-            "start_date":       rf'(?:Start Date|Starts|Start:){_SEP}([^\n]{{2,60}})',
+            "start_date":       rf'(?:Start Date|Starts)\s*:?{_SEP}(\d{{2}}/\d{{2}}/\d{{4}}[^\n]{{0,40}})',
             "project_length":   rf'(?:Duration|Project Length|Expected Length){_SEP}([^\n]{{2,60}})',
-            "timeline":         rf'Timeline{_SEP}([^\n]{{5,80}})',
+            "timeline":         rf'(?:Timeline|date_range){_SEP}(\d{{2}}/\d{{2}}/\d{{4}}[^\n]{{0,60}})',
             "engagement_type":  r'(?:Full time|Part time|Fractional)',
             "level_of_support": rf'Level of Support{_SEP}([^\n]{{2,60}})',
-            "industry":         rf'(?:Industry|Desired Industry Background){_SEP}([^\n]{{2,100}})',
-            "detail_budget":    rf'(?:Budget){_SEP}(\$[^\n]{{2,80}})',
-            "deadline":         rf'Deadline{_SEP}([^\n]{{2,30}})',
+            "industry":         rf'(?:^|\n)(?:Industry|Desired Industry Background)\s*:?{_SEP}([^\n]{{2,100}})',
+            "detail_budget":    rf'(?:Budget|savings){_SEP}(\$[^\n]{{2,80}})',
+            "deadline":         rf'Deadline:?{_SEP}([^\n]{{2,30}})',
             "location_type":    r'(On-site|Remote|Hybrid)',
         }
         for field, pattern in patterns.items():
@@ -1319,6 +1343,9 @@ def main():
                 # First cycle: send exactly 1 test email, then mark everything seen
                 project = all_projects[0]
                 print(f"🧪 TEST: Sending 1 test email → {project['title'][:60]}...")
+                print(f"     Fetching full project details...")
+                details = fetch_project_details(driver, project['url'])
+                project.update(details)
                 send_notification(project)
                 for p in all_projects:
                     seen_ids.add(p["id"])
