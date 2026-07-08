@@ -3,6 +3,8 @@ import smtplib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pymongo import MongoClient, UpdateOne
 from datetime import datetime, timezone, timedelta
@@ -14,6 +16,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from dotenv import load_dotenv
 
 # Load .env file from this script's directory
@@ -54,6 +57,7 @@ class Config:
 DEBUG_MODE = "--debug" in sys.argv
 ONCE_MODE  = "--once"  in sys.argv  # Run one check then exit (for testing)
 TEST_MODE  = "--test"  in sys.argv  # Skip MongoDB, send 1 test email only
+CHROMEDRIVER_LOG_PATH = "/tmp/chromedriver.log"
 
 def debug_print(msg):
     if DEBUG_MODE:
@@ -1162,25 +1166,93 @@ def send_notification(project):
 # ============================
 def _find_binary(env_var, candidates):
     """Return the first existing path from env var or candidate list."""
-    import shutil
     val = os.getenv(env_var, "")
     if val and os.path.exists(val):
         return val
     for path in candidates:
         if os.path.exists(path):
             return path
-    found = shutil.which(candidates[-1].split('/')[-1])
-    return found or ""
+    for path in candidates:
+        found = shutil.which(os.path.basename(path))
+        if found:
+            return found
+    return ""
+
+
+def _run_command_for_diagnostic(command):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        return output or f"exit code {result.returncode}"
+    except FileNotFoundError:
+        return "not found"
+    except Exception as e:
+        return f"failed: {e}"
+
+
+def print_browser_startup_diagnostics():
+    """Print lightweight Chromium/ChromeDriver diagnostics for container startup."""
+    chromium_path = shutil.which("chromium") or "not found"
+    chromedriver_path = shutil.which("chromedriver") or "not found"
+    print("  Browser startup diagnostics:")
+    print(f"    which chromium: {chromium_path}")
+    print(f"    chromium --version: {_run_command_for_diagnostic(['chromium', '--version'])}")
+    print(f"    which chromedriver: {chromedriver_path}")
+    print(f"    chromedriver --version: {_run_command_for_diagnostic(['chromedriver', '--version'])}")
+
+
+def print_chromedriver_log():
+    if not os.path.exists(CHROMEDRIVER_LOG_PATH):
+        print(f"  ChromeDriver log not found: {CHROMEDRIVER_LOG_PATH}")
+        return
+
+    try:
+        print(f"\n{'=' * 20} ChromeDriver log ({CHROMEDRIVER_LOG_PATH}) {'=' * 20}")
+        with open(CHROMEDRIVER_LOG_PATH, "r", encoding="utf-8", errors="replace") as log_file:
+            print(log_file.read().strip() or "(empty)")
+        print(f"{'=' * 64}\n")
+    except Exception as e:
+        print(f"  Failed to read ChromeDriver log: {e}")
+
+
+def prepare_chromedriver_log():
+    try:
+        open(CHROMEDRIVER_LOG_PATH, "w", encoding="utf-8").close()
+    except Exception as e:
+        print(f"  Could not initialize ChromeDriver log file: {e}")
+
+
+def create_chromedriver_service(driver_path=""):
+    service_kwargs = {
+        "service_args": ["--verbose"],
+        "log_output": CHROMEDRIVER_LOG_PATH,
+    }
+    if driver_path:
+        return Service(driver_path, **service_kwargs)
+    return Service(**service_kwargs)
 
 
 def initialize_driver():
+    print_browser_startup_diagnostics()
+    prepare_chromedriver_log()
+
     options = Options()
     if Config.HEADLESS:
         options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-debugging-port=9222")
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -1206,7 +1278,7 @@ def initialize_driver():
         "/usr/lib/chromium-browser/chromedriver",
     ])
     if system_path:
-        service = Service(system_path)
+        service = create_chromedriver_service(system_path)
         print(f"  Chromedriver (system): {system_path}")
     else:
         # Fallback: webdriver-manager (downloads matching chromedriver)
@@ -1216,13 +1288,18 @@ def initialize_driver():
             is_chromium = "chromium" in (chrome_bin or "").lower()
             mgr = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM if is_chromium else ChromeType.GOOGLE)
             driver_path = mgr.install()
-            service = Service(driver_path)
+            service = create_chromedriver_service(driver_path)
             print(f"  Chromedriver (webdriver-manager): {driver_path}")
         except Exception as e:
             print(f"  Using default Service(): {e}")
-            service = Service()
+            service = create_chromedriver_service()
 
-    driver = webdriver.Chrome(service=service, options=options)
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+    except Exception:
+        print_chromedriver_log()
+        raise
+
     driver.execute_cdp_cmd("Network.setUserAgentOverride", {
         "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     })
