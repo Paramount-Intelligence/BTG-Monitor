@@ -389,6 +389,178 @@ DESCRIPTION_SELECTORS = [
     "p",
 ]
 
+# Material icon ligature names that appear as plain text in Selenium .text
+MATERIAL_ICON_NAMES = {
+    "savings", "place", "insert_invitation", "schedule",
+    "location_on", "attach_money", "event", "timer",
+    "work", "business", "person", "star", "info",
+    "person_pin_circle", "date_range", "watch_later",
+    "home_work_filled", "home_work", "expand_more", "add",
+}
+_ICON_PREFIX_RE = re.compile(
+    r'^(?:' + '|'.join(re.escape(n) for n in sorted(MATERIAL_ICON_NAMES, key=len, reverse=True)) + r')\s+',
+    re.IGNORECASE,
+)
+_WORK_MODE_PHRASE_RE = re.compile(
+    r'\b(?:hybrid|remote|on[- ]?site|onsite|occasionally|occasional|travel|primarily)\b',
+    re.IGNORECASE,
+)
+
+
+def _strip_material_icons(text, join_with=" "):
+    """Remove Material icon ligature names from scraped text."""
+    if not text:
+        return ""
+    cleaned = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.lower() in MATERIAL_ICON_NAMES:
+            continue
+        s = _ICON_PREFIX_RE.sub("", s).strip()
+        if s and s.lower() not in MATERIAL_ICON_NAMES:
+            cleaned.append(s)
+    return join_with.join(cleaned)
+
+
+def _clean_location_geo(location):
+    """Keep geography only; drop work-mode / travel phrases and icon noise."""
+    if not location:
+        return ""
+    t = _strip_material_icons(location)
+    parts = [p.strip() for p in re.split(r'[,;]', t) if p.strip()]
+    geo = [p for p in parts if not _WORK_MODE_PHRASE_RE.search(p)]
+    return ", ".join(geo) if geo else t
+
+
+def _normalize_remote_type(value):
+    """Canonical Hybrid / Remote / Onsite, or empty string."""
+    if not value:
+        return ""
+    v = value.strip().lower().replace("_", " ")
+    if "hybrid" in v:
+        return "Hybrid"
+    if re.search(r'\bon[- ]?site\b', v) or v == "onsite":
+        return "Onsite"
+    if "remote" in v:
+        return "Remote"
+    return ""
+
+
+def _infer_remote_type(*text_parts):
+    """Prefer explicit Hybrid, then Remote, then Onsite; demote occasional on-site."""
+    block = "\n".join(p for p in text_parts if p)
+    if not block:
+        return ""
+
+    # Explicit UI / labeled modes (Hybrid wins over incidental "on-site")
+    if re.search(r'(?i)(?:^|\n)\s*hybrid\b', block) or re.search(r'(?i)\bhybrid\b\s*\(', block):
+        return "Hybrid"
+    if re.search(r'(?i)(?:^|\n)\s*remote\b', block):
+        # primarily remote + occasional travel/on-site ≈ Hybrid
+        if re.search(r'(?i)primarily\s+remote', block) and re.search(
+            r'(?i)(?:occasional|travel|on[- ]?site)', block
+        ):
+            return "Hybrid"
+        return "Remote"
+    if re.search(r'(?i)(?:^|\n)\s*on[- ]?site\b', block):
+        return "Onsite"
+
+    # Fallback: phrase scan with Hybrid > primarily-remote hybrid cues > Remote > Onsite
+    if re.search(r'(?i)\bhybrid\b', block):
+        return "Hybrid"
+    if re.search(r'(?i)primarily\s+remote', block):
+        if re.search(r'(?i)(?:occasional|travel|on[- ]?site)', block):
+            return "Hybrid"
+        return "Remote"
+    if re.search(r'(?i)\bremote\b', block) and not re.search(
+        r'(?i)occasionally\s+on[- ]?site', block
+    ):
+        return "Remote"
+    if re.search(r'(?i)\bon[- ]?site\b', block) and not re.search(
+        r'(?i)occasional(?:ly)?\s+on[- ]?site', block
+    ):
+        return "Onsite"
+    return ""
+
+
+def _parse_project_location_block(body_text):
+    """Parse BTG 'Project Location' section → (geo, remote_type, raw_block)."""
+    m = re.search(
+        r'(?:^|\n)\s*Project Location\s*\n'
+        r'([\s\S]+?)'
+        r'(?=\n(?:Timeline|date_range|Budget|savings|Apply Now|Deadline|'
+        r'Requirements?|Level of Support|Not for you)|\Z)',
+        body_text,
+        re.IGNORECASE,
+    )
+    if not m:
+        # Fallback: first person_pin_circle block (card/header style)
+        m = re.search(
+            r'(?:^|\n)\s*person_pin_circle\s*\n'
+            r'([\s\S]+?)'
+            r'(?=\n(?:Timeline|date_range|Budget|savings|Apply Now|Deadline|'
+            r'Project Location|Requirements?|Level of Support|Not for you)|\Z)',
+            body_text,
+            re.IGNORECASE,
+        )
+    if not m:
+        return "", "", ""
+    raw = m.group(1).strip()
+    skip_labels = {"project location", "location", "timeline", "budget"}
+    lines = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.lower() in MATERIAL_ICON_NAMES or s.lower() in skip_labels:
+            continue
+        s = _ICON_PREFIX_RE.sub("", s).strip()
+        if s and s.lower() not in MATERIAL_ICON_NAMES and s.lower() not in skip_labels:
+            lines.append(s)
+    if not lines:
+        return "", "", raw
+
+    remote_type = ""
+    geo = ""
+    for line in lines:
+        mode = _normalize_remote_type(line)
+        if mode and not remote_type:
+            remote_type = mode
+            continue
+        if not geo and not _WORK_MODE_PHRASE_RE.search(line):
+            geo = line
+            continue
+        if not geo and len(line) <= 80:
+            # short region / country lines
+            geo = _clean_location_geo(line) or line
+    if not remote_type:
+        remote_type = _infer_remote_type("\n".join(lines))
+    return geo, remote_type, raw
+
+
+def _extract_project_length(timeline, body_text, _sep):
+    """Prefer duration from Timeline; avoid mid-sentence 'Duration' prose."""
+    if timeline:
+        paren = re.search(r'\(([^)]*\b(?:month|week|day)s?\b[^)]*)\)', timeline, re.IGNORECASE)
+        if paren:
+            return paren.group(1).strip()
+        # whole timeline already encodes length
+        if re.search(r'\b(?:month|week|day)s?\b', timeline, re.IGNORECASE):
+            return timeline.strip()
+
+    # Line-anchored labeled duration only (not "… Duration of 6–8 months) …")
+    m = re.search(
+        rf'(?:^|\n)\s*(?:Duration|Project Length|Expected Length)\b\s*:?{_sep}([^\n]{{2,60}})',
+        body_text,
+        re.IGNORECASE,
+    )
+    if m:
+        val = m.group(1).strip()
+        # Reject prose fragments sliced from description
+        if re.match(r'(?i)(?:of|and)\b', val) or "primarily" in val.lower():
+            return ""
+        if re.search(r'\b(?:month|week|day|year)s?\b', val, re.IGNORECASE):
+            return val[:60]
+    return ""
+
 
 def _first_text(parent, selectors, max_len=200, skip_labels=None):
     """Return text from first matching child element, or empty string.
@@ -406,13 +578,7 @@ def _first_text(parent, selectors, max_len=200, skip_labels=None):
                     for label in skip_labels:
                         if t.lower().startswith(label.lower()):
                             t = t[len(label):].strip()
-                    # Remove Material icon text (single lowercase words: 'savings', 'place', etc.)
-                    ICON_NAMES = {"savings", "place", "insert_invitation", "schedule",
-                                  "location_on", "attach_money", "event", "timer",
-                                  "work", "business", "person", "star", "info"}
-                    lines = [l.strip() for l in t.splitlines()
-                             if l.strip() and l.strip().lower() not in ICON_NAMES]
-                    t = " ".join(lines)
+                    t = _strip_material_icons(t)
                     if t:
                         return t[:max_len]
         except Exception:
@@ -473,7 +639,7 @@ def extract_project_data(card):
         # Clean up: remove "Posted" prefix if present
         time_posted = re.sub(r'(?i)^posted\s*', '', time_posted).strip()
 
-        location   = _first_text(card, LOCATION_SELECTORS, 80)
+        location   = _clean_location_geo(_first_text(card, LOCATION_SELECTORS, 80))
         budget     = _first_text(card, BUDGET_SELECTORS, 80)
         duration   = _first_text(card, DURATION_SELECTORS, 80)
 
@@ -669,10 +835,14 @@ def insert_project(project, emailed=True):
             "title":            project.get("title"),
             "description":      project.get("description"),
             "location":         project.get("location"),
+            "location_pref":    project.get("location_pref"),
+            "remote_type":      project.get("remote_type"),
             "budget":           project.get("budget"),
             "duration":         project.get("duration"),
             "start_date":       project.get("start_date"),
+            "timeline":         project.get("timeline"),
             "project_length":   project.get("project_length"),
+            "engagement_type":  project.get("engagement_type"),
             "level_of_support": project.get("level_of_support"),
             "industry":         project.get("industry"),
             "time_posted":      project.get("time_posted"),
@@ -926,15 +1096,9 @@ def fetch_project_details(driver, url):
 
         # Clean material icon text and nav cruft from description
         if details.get("description"):
-            ICON_NAMES = {"savings", "place", "insert_invitation", "schedule",
-                          "location_on", "attach_money", "event", "timer",
-                          "work", "business", "person", "star", "info",
-                          "person_pin_circle", "date_range", "watch_later",
-                          "home_work_filled", "expand_more", "add"}
-            lines = details["description"].splitlines()
-            cleaned = [l.strip() for l in lines
-                       if l.strip() and l.strip().lower() not in ICON_NAMES]
-            details["description"] = "\n".join(cleaned)
+            details["description"] = _strip_material_icons(
+                details["description"], join_with="\n"
+            )
 
         # Extract structured fields.
         # _SEP matches label→value separator in two formats:
@@ -943,14 +1107,12 @@ def fetch_project_details(driver, url):
         _SEP = r'(?:[ \t]+|[ \t]*\n(?:[ \t]*\n)*[ \t]*)'
         patterns = {
             "start_date":       rf'(?:Start Date|Starts)\s*:?{_SEP}(\d{{2}}/\d{{2}}/\d{{4}}[^\n]{{0,40}})',
-            "project_length":   rf'(?:Duration|Project Length|Expected Length){_SEP}([^\n]{{2,60}})',
-            "timeline":         rf'(?:Timeline|date_range){_SEP}(\d{{2}}/\d{{2}}/\d{{4}}[^\n]{{0,60}})',
+            "timeline":         rf'(?:Timeline|date_range){_SEP}(\d{{2}}/\d{{2}}/\d{{4}}[^\n]{{0,80}})',
             "engagement_type":  r'(?:Full time|Part time|Fractional)',
             "level_of_support": rf'Level of Support{_SEP}([^\n]{{2,60}})',
             "industry":         rf'(?:^|\n)(?:Industry|Desired Industry Background)\s*:?{_SEP}([^\n]{{2,100}})',
             "detail_budget":    rf'(?:Budget|savings){_SEP}(\$[^\n]{{2,80}})',
             "deadline":         rf'Deadline:?{_SEP}([^\n]{{2,30}})',
-            "location_type":    r'(On-site|Remote|Hybrid)',
         }
         for field, pattern in patterns.items():
             m = re.search(pattern, body_text, re.IGNORECASE)
@@ -958,6 +1120,27 @@ def fetch_project_details(driver, url):
                 val = (m.group(1) if m.lastindex else m.group(0)).strip()
                 if val:
                     details[field] = val
+
+        # Project length: Timeline duration first; never mid-sentence "Duration …"
+        proj_len = _extract_project_length(
+            details.get("timeline", ""), body_text, _SEP
+        )
+        if proj_len:
+            details["project_length"] = proj_len
+
+        # Project Location block → clean geo + Hybrid/Remote/Onsite
+        loc_geo, loc_mode, loc_block = _parse_project_location_block(body_text)
+        if loc_geo:
+            details["location"] = loc_geo
+        remote_type = loc_mode or _infer_remote_type(
+            loc_block,
+            details.get("description", ""),
+            body_text,
+        )
+        if remote_type:
+            details["remote_type"] = remote_type
+            details["location_pref"] = remote_type
+            details["location_type"] = remote_type  # email display (backward compat)
 
         # Extract Requirements as a bullet list
         req_match = re.search(
@@ -1010,7 +1193,11 @@ def create_email_html(project):
     project_id      = project.get("id", "")
     description     = project.get("description", "")
     location        = project.get("location", "") or "Remote / Not specified"
-    location_type   = project.get("location_type", "")
+    location_type   = (
+        project.get("remote_type")
+        or project.get("location_pref")
+        or project.get("location_type", "")
+    )
     start_date      = project.get("start_date", "")
     timeline        = project.get("timeline", "")
     proj_length     = project.get("project_length", "") or project.get("duration", "")
