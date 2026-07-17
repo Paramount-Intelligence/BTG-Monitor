@@ -801,6 +801,28 @@ def scan_for_projects(driver):
 # ============================
 _mongo_client = None
 
+def _normalize_posted_date(time_str):
+    """Normalize a posted-date string to MM/DD/YYYY, or '' if no date found."""
+    if not time_str:
+        return ""
+    s = str(time_str).strip()
+    m = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', s)
+    if m:
+        return f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{m.group(3)}"
+    m = re.search(r'(\d{4})-(\d{2})-(\d{2})', s)
+    if m:
+        return f"{int(m.group(2)):02d}/{int(m.group(3)):02d}/{m.group(1)}"
+    return ""
+
+
+def make_dedupe_key(project_id, time_posted):
+    """Dedupe key = project_id + posted date, so re-posts count as new."""
+    if not project_id:
+        return ""
+    date = _normalize_posted_date(time_posted)
+    return f"{project_id}|{date}" if date else str(project_id)
+
+
 def _get_collection():
     """Return the MongoDB collection, reusing the client across calls."""
     global _mongo_client
@@ -809,28 +831,48 @@ def _get_collection():
     return _mongo_client["office_monitor"]["projects"]
 
 def init_db():
-    """Ensure a unique index on 'project_id' exists."""
+    """Ensure a unique index on 'dedupe_key' (project_id + posted date)."""
+    coll = _get_collection()
+    # Legacy unique index on project_id would block re-post inserts — drop it.
     try:
-        _get_collection().create_index("project_id", unique=True, name="idx_project_id_unique")
+        coll.drop_index("idx_project_id_unique")
+        print("  DB: dropped legacy unique index on project_id (re-posts now allowed)")
     except Exception:
-        pass  # Index already exists — safe to ignore
+        pass
+    try:
+        # sparse: existing docs without dedupe_key don't collide on the index
+        coll.create_index("dedupe_key", unique=True, sparse=True, name="idx_dedupe_key_unique")
+        coll.create_index("project_id", name="idx_project_id")
+    except Exception:
+        pass  # Indexes already exist — safe to ignore
 
 def db_is_cold_start():
     """True if the collection has no documents (first ever run)."""
     return _get_collection().find_one({}, {"_id": 1}) is None
 
 def get_seen_ids():
-    """Return set of all project IDs already in DB."""
+    """Return set of dedupe keys (project_id + posted date) already in DB."""
     try:
-        docs = _get_collection().find({}, {"project_id": 1, "_id": 0})
-        return {d["project_id"] for d in docs if d.get("project_id")}
+        docs = _get_collection().find(
+            {}, {"project_id": 1, "time_posted": 1, "dedupe_key": 1, "_id": 0}
+        )
+        keys = set()
+        for d in docs:
+            # Older docs lack dedupe_key — rebuild it from stored fields
+            key = d.get("dedupe_key") or make_dedupe_key(
+                d.get("project_id"), d.get("time_posted")
+            )
+            if key:
+                keys.add(key)
+        return keys
     except Exception:
         return set()
 
 def insert_project(project, emailed=True):
-    """Upsert one project record. Silently skips if ID already exists."""
+    """Upsert one project record keyed on dedupe_key (id + posted date)."""
     try:
         doc = {
+            "dedupe_key":       make_dedupe_key(project.get("id"), project.get("time_posted")),
             "project_id":       project.get("id"),
             "title":            project.get("title"),
             "description":      project.get("description"),
@@ -853,7 +895,7 @@ def insert_project(project, emailed=True):
             "emailed":          bool(emailed),
         }
         _get_collection().update_one(
-            {"project_id": doc["project_id"]},
+            {"dedupe_key": doc["dedupe_key"]},
             {"$setOnInsert": doc},
             upsert=True,
         )
@@ -868,6 +910,7 @@ def bulk_insert_projects(projects, emailed=False):
             if not p.get("id"):
                 continue
             doc = {
+                "dedupe_key":  make_dedupe_key(p.get("id"), p.get("time_posted")),
                 "project_id":  p.get("id"),
                 "title":       p.get("title"),
                 "location":    p.get("location"),
@@ -880,7 +923,7 @@ def bulk_insert_projects(projects, emailed=False):
                 "platform":    "btg",
                 "emailed":     bool(emailed),
             }
-            ops.append(UpdateOne({"project_id": doc["project_id"]}, {"$setOnInsert": doc}, upsert=True))
+            ops.append(UpdateOne({"dedupe_key": doc["dedupe_key"]}, {"$setOnInsert": doc}, upsert=True))
         if ops:
             result = _get_collection().bulk_write(ops, ordered=False)
             print(f"  DB: inserted {result.upserted_count} records (emailed={'yes' if emailed else 'no'})")
@@ -938,14 +981,16 @@ def parse_posted_minutes(time_str):
 
 
 def filter_new_projects(all_projects, seen_ids):
-    """Remove already-seen IDs and jobs older than MAX_AGE_MINUTES."""
+    """Keep projects whose dedupe key (id + posted date) is unseen.
+    No age filtering: every unseen project is emailed and stored.
+    A re-post (same id, new posted date) counts as new again.
+    """
     result = []
     for p in all_projects:
-        if not p.get("id") or p["id"] in seen_ids:
+        if not p.get("id"):
             continue
-        age = parse_posted_minutes(p.get("time_posted", ""))
-        if age is not None and age > Config.MAX_AGE_MINUTES:
-            print(f"  [SKIP - too old] {p['title'][:50]} (posted {p['time_posted']} ago)")
+        key = make_dedupe_key(p["id"], p.get("time_posted", ""))
+        if key in seen_ids:
             continue
         result.append(p)
     return result
@@ -1518,7 +1563,7 @@ def main():
     print("=" * 50)
     print(f"  Account  : {Config.BTG_EMAIL}")
     print(f"  Interval : {Config.CHECK_INTERVAL}s")
-    print(f"  Max age  : {Config.MAX_AGE_MINUTES} min")
+    print("  Max age  : disabled (all unseen projects are saved & emailed)")
     print(f"  Recipients: {', '.join(Config.RECIPIENT_EMAILS)}")
     print()
 
@@ -1612,7 +1657,7 @@ def main():
                 project.update(details)
                 send_notification(project)
                 for p in all_projects:
-                    seen_ids.add(p["id"])
+                    seen_ids.add(make_dedupe_key(p["id"], p.get("time_posted", "")))
             elif new_projects:
                 print(f"🎯 Found {len(new_projects)} NEW project(s)!")
                 for project in new_projects:
@@ -1623,7 +1668,7 @@ def main():
                     emailed = send_notification(project)
                     if not TEST_MODE:
                         insert_project(project, emailed=emailed)
-                    seen_ids.add(project['id'])
+                    seen_ids.add(make_dedupe_key(project['id'], project.get('time_posted', '')))
             else:
                 print("⏳ No new projects this cycle")
 
