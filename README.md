@@ -27,6 +27,9 @@ error_recipent=operations@example.com
 ERROR_EMAIL_COOLDOWN_MINUTES=30
 LOGIN_RETRY_INTERVAL=300
 BTG_LOGIN_DIAGNOSTIC_MODE=false
+BTG_CLEAR_SESSION_ON_START=false
+BTG_CAPTURE_NETWORK_LOGS=false
+BTG_PAUSE_AFTER_LOGIN_FAILURE=false
 
 CHECK_INTERVAL=60
 HEADLESS=true
@@ -37,6 +40,27 @@ The misspelled key `error_recipent` is intentional and supported. Aliases `ERROR
 
 `BTG_LOGIN_DIAGNOSTIC_MODE=true` disables headless for login troubleshooting only. Keep it `false` in production.
 
+## Local login diagnostic
+
+```bash
+# Test 1 — headed Chrome
+set BTG_LOGIN_DIAGNOSTIC_MODE=true
+set BTG_CLEAR_SESSION_ON_START=true
+set BTG_CAPTURE_NETWORK_LOGS=true
+set BTG_PAUSE_AFTER_LOGIN_FAILURE=true
+python btg_script.py --test-btg-login
+
+# Test 2 — headless Chrome
+set BTG_LOGIN_DIAGNOSTIC_MODE=false
+set HEADLESS=true
+set BTG_CLEAR_SESSION_ON_START=true
+set BTG_CAPTURE_NETWORK_LOGS=true
+set BTG_PAUSE_AFTER_LOGIN_FAILURE=false
+python btg_script.py --test-btg-login
+```
+
+Evidence is written under `/tmp` (or the OS temp dir) as `btg_local_login_<timestamp>.*`.
+
 ## Useful commands
 
 ```bash
@@ -44,5 +68,6 @@ python btg_script.py
 python btg_script.py --once
 python btg_script.py --test
 python btg_script.py --test-error-email
+python btg_script.py --test-btg-login
 python btg_script.py --debug
 ```
