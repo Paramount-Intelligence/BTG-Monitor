@@ -26,6 +26,7 @@ RECIPIENT_EMAILS=project1@example.com,project2@example.com
 error_recipent=operations@example.com
 ERROR_EMAIL_COOLDOWN_MINUTES=30
 LOGIN_RETRY_INTERVAL=300
+BTG_LOGIN_DIAGNOSTIC_MODE=false
 
 CHECK_INTERVAL=60
 HEADLESS=true
@@ -33,6 +34,8 @@ MONGO_URI=mongodb://localhost:27017/
 ```
 
 The misspelled key `error_recipent` is intentional and supported. Aliases `ERROR_RECIPENT`, `ERROR_RECIPIENT`, and `ERROR_RECIPIENTS` also work.
+
+`BTG_LOGIN_DIAGNOSTIC_MODE=true` disables headless for login troubleshooting only. Keep it `false` in production.
 
 ## Useful commands
 

@@ -3,6 +3,7 @@ import smtplib
 import json
 import os
 import re
+import hashlib
 import shutil
 import socket
 import subprocess
@@ -65,6 +66,10 @@ class Config:
     CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", 60))
     MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", 60))
     HEADLESS     = os.getenv("HEADLESS", "False").lower() == "true"
+    # When true: disable headless for login diagnostics only (not for production)
+    BTG_LOGIN_DIAGNOSTIC_MODE = (
+        os.getenv("BTG_LOGIN_DIAGNOSTIC_MODE", "false").lower() == "true"
+    )
     COOKIES_FILE = os.getenv("BTG_COOKIES_FILE", "btg_cookies.json")
     MONGO_URI    = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 
@@ -165,8 +170,12 @@ def dump_page_structure(driver):
 class LoginResult:
     SUCCESS = "SUCCESS"
     INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
+    INVALID_CREDENTIALS_RESPONSE = "INVALID_CREDENTIALS_RESPONSE"
     CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
     MFA_REQUIRED = "MFA_REQUIRED"
+    ACCESS_DENIED = "ACCESS_DENIED"
+    ACCOUNT_LOCKED = "ACCOUNT_LOCKED"
+    FORM_VALUE_MISMATCH = "FORM_VALUE_MISMATCH"
     LOGIN_TIMEOUT = "LOGIN_TIMEOUT"
     LOGIN_PAGE_CHANGED = "LOGIN_PAGE_CHANGED"
     CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
@@ -174,8 +183,12 @@ class LoginResult:
 
     AUTH_BLOCKERS = {
         INVALID_CREDENTIALS,
+        INVALID_CREDENTIALS_RESPONSE,
         CAPTCHA_REQUIRED,
         MFA_REQUIRED,
+        ACCESS_DENIED,
+        ACCOUNT_LOCKED,
+        FORM_VALUE_MISMATCH,
         LOGIN_TIMEOUT,
         LOGIN_PAGE_CHANGED,
         CONFIGURATION_ERROR,
@@ -193,6 +206,77 @@ class LoginResult:
 
     def __bool__(self):
         return self.ok
+
+
+def safe_fingerprint(value):
+    """SHA-256 prefix (12 hex chars) for safe credential comparison. Never logs the value."""
+    if value is None:
+        return "EMPTY"
+    if value == "":
+        return "EMPTY"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def credential_diagnostics(email_value, configured_password, typed_password):
+    """Safe credential diagnostics — lengths and fingerprints only, never plaintext."""
+    email_value = "" if email_value is None else str(email_value)
+    configured_password = "" if configured_password is None else str(configured_password)
+    typed_password = "" if typed_password is None else str(typed_password)
+
+    cfg_fp = safe_fingerprint(configured_password)
+    typed_fp = safe_fingerprint(typed_password)
+    passwords_match = configured_password == typed_password
+    email_ws = email_value != email_value.strip()
+    password_ws = configured_password != configured_password.strip()
+    email_empty = email_value == ""
+    password_empty = configured_password == ""
+
+    print(f"  Configured BTG email: {email_value!r}")
+    print(f"  Configured password length: {len(configured_password)}")
+    print(f"  Typed password length: {len(typed_password)}")
+    print(f"  Configured password fingerprint: {cfg_fp}")
+    print(f"  Typed password fingerprint: {typed_fp}")
+    print(f"  Configured and typed passwords match: {passwords_match}")
+    print(f"  Email surrounding whitespace: {email_ws}")
+    print(f"  Password surrounding whitespace: {password_ws}")
+    if email_empty or password_empty:
+        print(f"  Configured email empty: {email_empty}")
+        print(f"  Configured password empty: {password_empty}")
+
+    return {
+        "configured_email_repr": repr(email_value),
+        "configured_password_length": len(configured_password),
+        "typed_password_length": len(typed_password),
+        "configured_password_fingerprint": cfg_fp,
+        "typed_password_fingerprint": typed_fp,
+        "password_values_match": passwords_match,
+        "email_surrounding_whitespace": email_ws,
+        "password_surrounding_whitespace": password_ws,
+        "email_empty": email_empty,
+        "password_empty": password_empty,
+    }
+
+
+def get_native_browser_info(driver):
+    """Read native navigator identity (no cookies/storage/secrets)."""
+    try:
+        info = driver.execute_script(
+            """
+            return {
+                userAgent: navigator.userAgent || '',
+                platform: navigator.platform || '',
+                language: navigator.language || ''
+            };
+            """
+        ) or {}
+        return {
+            "userAgent": info.get("userAgent", ""),
+            "platform": info.get("platform", ""),
+            "language": info.get("language", ""),
+        }
+    except Exception as e:
+        print(f"  ⚠️ Could not read native browser info: {e}")
+        return {"userAgent": "", "platform": "", "language": ""}
 
 
 def _safe_quit(driver):
@@ -413,12 +497,13 @@ def run_test_error_email():
     return ok
 
 
-def save_login_failure_evidence(driver, prefix="btg_login_failure"):
-    """Save screenshot + HTML evidence. Returns (png_path, html_path)."""
+def save_login_failure_evidence(driver, prefix="btg_login_failure", diagnostics=None):
+    """Save screenshot + HTML + safe JSON diagnostics. Returns (png, html, json)."""
     ts = datetime.now(PKT).strftime("%Y%m%d_%H%M%S")
     base = os.path.join(_evidence_dir(), f"{prefix}_{ts}")
     png_path = f"{base}.png"
     html_path = f"{base}.html"
+    json_path = f"{base}.json"
     try:
         driver.save_screenshot(png_path)
         print(f"  Saved login failure screenshot: {png_path}")
@@ -432,23 +517,33 @@ def save_login_failure_evidence(driver, prefix="btg_login_failure"):
     except Exception as e:
         print(f"  ⚠️ HTML capture failed: {e}")
         html_path = ""
-    return png_path, html_path
+    try:
+        # diagnostics already curated — never write passwords/cookies/tokens
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(diagnostics or {}, fh, indent=2, default=str)
+        print(f"  Saved login failure JSON: {json_path}")
+    except Exception as e:
+        print(f"  ⚠️ JSON diagnostics failed: {e}")
+        json_path = ""
+    return png_path, html_path, json_path
 
 
 def _dispatch_angular_events(driver, element):
     driver.execute_script(
         """
-        var el = arguments[0];
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        const field = arguments[0];
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+        field.dispatchEvent(new Event('blur', { bubbles: true }));
         """,
         element,
     )
 
 
 def _fill_input_field(driver, element, value, label, is_password=False):
-    """Click, clear via Ctrl+A/Backspace, type, fire Angular events, verify value."""
+    """Click, clear via Ctrl+A/Backspace, type, fire Angular events, verify exact value.
+    Returns (ok: bool, actual_value: str).
+    """
     WebDriverWait(driver, 10).until(lambda d: element.is_displayed() and element.is_enabled())
     element.click()
     time.sleep(0.2)
@@ -463,18 +558,24 @@ def _fill_input_field(driver, element, value, label, is_password=False):
     element.send_keys(value)
     _dispatch_angular_events(driver, element)
     time.sleep(0.3)
-    actual = element.get_attribute("value") or ""
-    if is_password:
-        print(f"  Password field populated: {len(actual)} characters.")
-        if len(actual) != len(value):
-            print(f"  ⚠️ Password length mismatch (expected {len(value)}, got {len(actual)})")
-            return False
-    else:
-        print(f"  {label} field populated.")
-        if actual.strip() != str(value).strip():
+    actual = element.get_attribute("value")
+    if actual is None:
+        actual = ""
+    # Exact match required — do not strip (whitespace may be intentional for passwords)
+    if actual != value:
+        if is_password:
+            print(
+                f"  ⚠️ Password value mismatch after fill "
+                f"(configured length {len(value)}, typed length {len(actual)})"
+            )
+        else:
             print(f"  ⚠️ {label} value mismatch after fill")
-            return False
-    return True
+        return False, actual
+    if is_password:
+        print(f"  Password field populated and verified: {len(actual)} characters.")
+    else:
+        print(f"  {label} field populated and verified.")
+    return True, actual
 
 
 def _find_login_submit_button(driver):
@@ -537,7 +638,6 @@ def _safe_page_text(driver, limit=2000):
         text = driver.find_element(By.TAG_NAME, "body").text or ""
     except Exception:
         text = ""
-    # Strip anything that looks like an email password field value is already not in body.text usually
     return text[:limit]
 
 
@@ -548,8 +648,11 @@ def _classify_login_outcome(driver):
         title = driver.title or ""
     except Exception:
         title = ""
-    body = _safe_page_text(driver, 4000).lower()
+    body_raw = _safe_page_text(driver, 4000)
+    body = body_raw.lower()
     error_text = _collect_visible_login_errors(driver)
+    error_l = (error_text or "").lower()
+    combined = f"{body}\n{error_l}"
 
     left_login = (
         "login" not in url
@@ -560,7 +663,6 @@ def _classify_login_outcome(driver):
     if left_login:
         return LoginResult.SUCCESS, "Redirected away from login"
 
-    # Logged-in project-page markers while URL still resolving
     for sel in (
         "div.detail.date-posted",
         ".detail.date-posted",
@@ -575,25 +677,46 @@ def _classify_login_outcome(driver):
             pass
 
     captcha_phrases = ("captcha", "verify you are human", "recaptcha", "hcaptcha", "bot detection")
-    if any(p in body for p in captcha_phrases) or "captcha" in url:
+    if any(p in combined for p in captcha_phrases) or "captcha" in url:
         return LoginResult.CAPTCHA_REQUIRED, "CAPTCHA / bot verification detected — manual action required"
 
     mfa_phrases = (
         "verification code", "two-factor", "multi-factor", "2-factor",
         "one-time password", "one time password", "authenticator", "enter the code",
     )
-    if any(p in body for p in mfa_phrases):
+    if any(p in combined for p in mfa_phrases):
         return LoginResult.MFA_REQUIRED, "MFA / verification code page detected — manual action required"
 
-    lock_phrases = ("access denied", "account locked", "too many attempts", "temporarily locked")
-    if any(p in body for p in lock_phrases):
-        return LoginResult.INVALID_CREDENTIALS, error_text or "Account locked or access denied"
+    if "account locked" in combined or "temporarily locked" in combined or "too many attempts" in combined:
+        return LoginResult.ACCOUNT_LOCKED, error_text or "Account locked / too many attempts"
+
+    if "access denied" in combined:
+        return LoginResult.ACCESS_DENIED, error_text or "Access denied"
+
+    # BTG-specific invalid combination message (may appear with generic "something went wrong")
+    invalid_combo = (
+        "can't find that email address and password combination" in combined
+        or "cannot find that email address and password combination" in combined
+        or "we can't find that email" in combined
+    )
+    something_wrong = "something went wrong, please try again later" in combined
+    if invalid_combo:
+        msg = (
+            "BTG returned INVALID_CREDENTIALS_RESPONSE "
+            "('can't find that email address and password combination'). "
+            "This is the platform response and does not by itself prove the "
+            "configured password is incorrect — especially when manual login works "
+            "and configured/typed fingerprints match."
+        )
+        if something_wrong:
+            msg += " Page also showed 'Something went wrong, please try again later'."
+        return LoginResult.INVALID_CREDENTIALS_RESPONSE, msg
 
     cred_phrases = (
         "invalid", "incorrect", "authentication failed", "unable to sign in",
-        "wrong password", "wrong email", "credentials",
+        "wrong password", "wrong email",
     )
-    if error_text or any(p in body for p in cred_phrases):
+    if error_text or any(p in combined for p in cred_phrases):
         return LoginResult.INVALID_CREDENTIALS, error_text or "Invalid credentials indicated on page"
 
     if "login" in url or "sign" in url:
@@ -693,12 +816,14 @@ def load_cookies(driver):
         return False
 
 
-def clear_stale_cookies():
-    """Remove expired cookie records so they are not reloaded on every restart."""
+def invalidate_saved_cookies():
+    """Delete expired cookie records so they are not reloaded on every restart."""
+    ok = True
     try:
         _get_session_collection().delete_one({"_id": "btg_cookies"})
         print("  Cleared stale cookies from MongoDB")
     except Exception as e:
+        ok = False
         print(f"  ⚠️ Could not clear MongoDB cookies: {e}")
         send_error_notification(
             "COOKIE_CLEAR_FAILURE",
@@ -711,21 +836,83 @@ def clear_stale_cookies():
             os.remove(path)
             print("  Cleared stale local cookie backup")
     except Exception as e:
+        ok = False
         print(f"  ⚠️ Could not clear local cookie backup: {e}")
+        send_error_notification(
+            "COOKIE_CLEAR_FAILURE",
+            e,
+            details="Failed to delete expired local BTG cookie backup.",
+        )
+    return ok
+
+
+# Backward-compatible alias
+clear_stale_cookies = invalidate_saved_cookies
+
+
+def clear_btg_browser_session(driver):
+    """Fully clear cookies, storage, and cache before a fresh login."""
+    cleared = {
+        "cookies_deleted": False,
+        "local_storage_cleared": False,
+        "session_storage_cleared": False,
+        "cdp_cookies_cleared": False,
+        "cdp_cache_cleared": False,
+    }
+    if not driver:
+        return cleared
+    try:
+        driver.get(Config.BASE_URL)
+        time.sleep(1)
+    except Exception as e:
+        print(f"  ⚠️ Could not open BASE_URL for session clear: {e}")
+
+    try:
+        driver.delete_all_cookies()
+        cleared["cookies_deleted"] = True
+    except Exception as e:
+        print(f"  ⚠️ delete_all_cookies failed: {e}")
+
+    try:
+        driver.execute_script(
+            """
+            try { window.localStorage.clear(); } catch (e) {}
+            try { window.sessionStorage.clear(); } catch (e) {}
+            """
+        )
+        cleared["local_storage_cleared"] = True
+        cleared["session_storage_cleared"] = True
+    except Exception as e:
+        print(f"  ⚠️ local/sessionStorage clear failed: {e}")
+
+    try:
+        driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
+        cleared["cdp_cookies_cleared"] = True
+    except Exception:
+        pass
+
+    try:
+        driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+        cleared["cdp_cache_cleared"] = True
+    except Exception:
+        pass
+
+    print(
+        "  Browser session cleared "
+        f"(cookies={cleared['cookies_deleted']}, "
+        f"storage={cleared['local_storage_cleared']}, "
+        f"cdp_cookies={cleared['cdp_cookies_cleared']}, "
+        f"cdp_cache={cleared['cdp_cache_cleared']})"
+    )
+    return cleared
 
 
 def _login_failure_alert(driver, result, diagnostics):
     """Persist evidence and email a detailed login failure (cooldown applies)."""
-    png_path, html_path = "", ""
-    if driver:
-        try:
-            png_path, html_path = save_login_failure_evidence(driver)
-        except Exception as e:
-            print(f"  ⚠️ Evidence capture failed: {e}")
-
-    page_text = ""
+    png_path, html_path, json_path = "", "", ""
     current_url = ""
     page_title = ""
+    page_text = ""
     if driver:
         try:
             current_url = driver.current_url
@@ -737,23 +924,75 @@ def _login_failure_alert(driver, result, diagnostics):
             pass
         page_text = _safe_page_text(driver, 2000)
 
+    # Enrich safe diagnostics for JSON evidence
+    safe_diag = {
+        "result": result.status,
+        "message": result.message,
+        "current_url": current_url,
+        "page_title": page_title,
+        "headless": Config.HEADLESS and not Config.BTG_LOGIN_DIAGNOSTIC_MODE,
+        "diagnostic_mode": Config.BTG_LOGIN_DIAGNOSTIC_MODE,
+        "email_field_found": diagnostics.get("email_found"),
+        "password_field_found": diagnostics.get("password_found"),
+        "submit_found": diagnostics.get("submit_found"),
+        "submit_enabled": diagnostics.get("submit_enabled"),
+        "submitted": diagnostics.get("submitted"),
+        "configured_password_length": diagnostics.get("configured_password_length"),
+        "typed_password_length": diagnostics.get("typed_password_length"),
+        "configured_password_fingerprint": diagnostics.get("configured_password_fingerprint"),
+        "typed_password_fingerprint": diagnostics.get("typed_password_fingerprint"),
+        "password_values_match": diagnostics.get("password_values_match"),
+        "email_surrounding_whitespace": diagnostics.get("email_surrounding_whitespace"),
+        "password_surrounding_whitespace": diagnostics.get("password_surrounding_whitespace"),
+        "native_user_agent": diagnostics.get("native_user_agent", ""),
+        "native_platform": diagnostics.get("native_platform", ""),
+        "native_language": diagnostics.get("native_language", ""),
+        "captcha_detected": result.status == LoginResult.CAPTCHA_REQUIRED,
+        "mfa_detected": result.status == LoginResult.MFA_REQUIRED,
+        "cookies_invalidated": diagnostics.get("cookies_invalidated"),
+        "browser_session_cleared": diagnostics.get("browser_session_cleared"),
+        "visible_error": diagnostics.get("visible_error", ""),
+    }
+
+    if driver:
+        try:
+            png_path, html_path, json_path = save_login_failure_evidence(
+                driver, diagnostics=safe_diag
+            )
+        except Exception as e:
+            print(f"  ⚠️ Evidence capture failed: {e}")
+
     details_parts = [
         f"Login result: {result.status}",
         f"Message: {result.message}",
+        f"Native user-agent: {diagnostics.get('native_user_agent', '')}",
         f"Email field found: {diagnostics.get('email_found')}",
         f"Password field found: {diagnostics.get('password_found')}",
         f"Submit button found: {diagnostics.get('submit_found')}",
         f"Submit button enabled: {diagnostics.get('submit_enabled')}",
         f"Form submission attempted: {diagnostics.get('submitted')}",
+        f"Configured password length: {diagnostics.get('configured_password_length')}",
+        f"Typed password length: {diagnostics.get('typed_password_length')}",
+        f"Configured password fingerprint: {diagnostics.get('configured_password_fingerprint')}",
+        f"Typed password fingerprint: {diagnostics.get('typed_password_fingerprint')}",
+        f"Configured and typed passwords match: {diagnostics.get('password_values_match')}",
+        f"Email surrounding whitespace: {diagnostics.get('email_surrounding_whitespace')}",
+        f"Password surrounding whitespace: {diagnostics.get('password_surrounding_whitespace')}",
+        f"Saved cookies invalidated: {diagnostics.get('cookies_invalidated')}",
+        f"Browser session cleared: {diagnostics.get('browser_session_cleared')}",
         f"CAPTCHA detected: {result.status == LoginResult.CAPTCHA_REQUIRED}",
         f"MFA detected: {result.status == LoginResult.MFA_REQUIRED}",
         f"Screenshot: {png_path or 'n/a'}",
         f"HTML: {html_path or 'n/a'}",
+        f"JSON: {json_path or 'n/a'}",
+        "",
+        "Note: BTG invalid-combination responses do not prove the configured password "
+        "is wrong when fingerprints match and manual login works.",
         "",
         "Visible page text (truncated, no secrets):",
         page_text or "(unavailable)",
     ]
-    attachments = [p for p in (png_path, html_path) if p]
+    attachments = [p for p in (png_path, html_path, json_path) if p]
     send_error_notification(
         f"LOGIN_FAILURE:{result.status}",
         result.message or result.status,
@@ -762,19 +1001,26 @@ def _login_failure_alert(driver, result, diagnostics):
         extra_rows=[
             ("Current URL", current_url),
             ("Page title", page_title),
+            ("Result classification", result.status),
+            ("Native user-agent", diagnostics.get("native_user_agent", "")),
+            ("Configured pw length", diagnostics.get("configured_password_length")),
+            ("Typed pw length", diagnostics.get("typed_password_length")),
+            ("Configured pw fingerprint", diagnostics.get("configured_password_fingerprint")),
+            ("Typed pw fingerprint", diagnostics.get("typed_password_fingerprint")),
+            ("Passwords match", diagnostics.get("password_values_match")),
+            ("Email whitespace", diagnostics.get("email_surrounding_whitespace")),
+            ("Password whitespace", diagnostics.get("password_surrounding_whitespace")),
+            ("Cookies invalidated", diagnostics.get("cookies_invalidated")),
+            ("Session cleared", diagnostics.get("browser_session_cleared")),
             ("Visible login error", diagnostics.get("visible_error") or result.message),
-            ("Email field found", diagnostics.get("email_found")),
-            ("Password field found", diagnostics.get("password_found")),
-            ("Submit found/enabled",
-             f"{diagnostics.get('submit_found')} / {diagnostics.get('submit_enabled')}"),
-            ("Submitted", diagnostics.get("submitted")),
             ("Evidence PNG", png_path or "n/a"),
             ("Evidence HTML", html_path or "n/a"),
+            ("Evidence JSON", json_path or "n/a"),
         ],
     )
 
 
-def perform_login(driver):
+def perform_login(driver, cookies_invalidated=False, browser_session_cleared=None):
     """Log in to BTG with Angular-aware form fill and classified outcomes."""
     diagnostics = {
         "email_found": False,
@@ -783,12 +1029,20 @@ def perform_login(driver):
         "submit_enabled": False,
         "submitted": False,
         "visible_error": "",
+        "cookies_invalidated": bool(cookies_invalidated),
+        "browser_session_cleared": browser_session_cleared or {},
+        "native_user_agent": "",
+        "native_platform": "",
+        "native_language": "",
     }
 
+    # Do not silently strip passwords — report whitespace instead
+    email_missing = Config.BTG_EMAIL is None or Config.BTG_EMAIL == ""
+    password_missing = Config.BTG_PASSWORD is None or Config.BTG_PASSWORD == ""
     missing = []
-    if not (Config.BTG_EMAIL or "").strip():
+    if email_missing:
         missing.append("BTG_EMAIL")
-    if not (Config.BTG_PASSWORD or "").strip():
+    if password_missing:
         missing.append("BTG_PASSWORD")
     if missing:
         msg = f"Missing required environment variable(s): {', '.join(missing)}"
@@ -803,6 +1057,15 @@ def perform_login(driver):
         return result
 
     try:
+        browser_info = get_native_browser_info(driver)
+        diagnostics["native_user_agent"] = browser_info.get("userAgent", "")
+        diagnostics["native_platform"] = browser_info.get("platform", "")
+        diagnostics["native_language"] = browser_info.get("language", "")
+        if diagnostics["native_user_agent"]:
+            print(f"  Native user-agent: {diagnostics['native_user_agent']}")
+            print(f"  Native platform: {diagnostics['native_platform']}")
+            print(f"  Native language: {diagnostics['native_language']}")
+
         print(f"  Navigating to: {Config.LOGIN_URL}")
         driver.get(Config.LOGIN_URL)
         time.sleep(3)
@@ -842,10 +1105,10 @@ def perform_login(driver):
                 email_field = WebDriverWait(driver, 8).until(
                     EC.visibility_of_element_located((By.CSS_SELECTOR, sel))
                 )
-                if email_field.is_enabled():
-                    break
-                email_field = None
+                WebDriverWait(driver, 5).until(lambda d: email_field.is_enabled())
+                break
             except TimeoutException:
+                email_field = None
                 continue
 
         if not email_field:
@@ -859,10 +1122,15 @@ def perform_login(driver):
             return result
 
         diagnostics["email_found"] = True
-        if not _fill_input_field(driver, email_field, Config.BTG_EMAIL, "Email"):
+        email_ok, typed_email = _fill_input_field(
+            driver, email_field, Config.BTG_EMAIL, "Email"
+        )
+        if not email_ok:
+            cred = credential_diagnostics(Config.BTG_EMAIL, Config.BTG_PASSWORD, "")
+            diagnostics.update(cred)
             result = LoginResult(
-                LoginResult.UNKNOWN_LOGIN_FAILURE,
-                "Failed to populate email field with expected value",
+                LoginResult.FORM_VALUE_MISMATCH,
+                "Email field value did not exactly match configured BTG_EMAIL after typing",
             )
             _login_failure_alert(driver, result, diagnostics)
             return result
@@ -879,10 +1147,10 @@ def perform_login(driver):
                 password_field = WebDriverWait(driver, 5).until(
                     EC.visibility_of_element_located((By.CSS_SELECTOR, sel))
                 )
-                if password_field.is_enabled():
-                    break
-                password_field = None
+                WebDriverWait(driver, 5).until(lambda d: password_field.is_enabled())
+                break
             except (TimeoutException, NoSuchElementException):
+                password_field = None
                 continue
 
         if not password_field:
@@ -895,12 +1163,16 @@ def perform_login(driver):
             return result
 
         diagnostics["password_found"] = True
-        if not _fill_input_field(
+        pw_ok, typed_password = _fill_input_field(
             driver, password_field, Config.BTG_PASSWORD, "Password", is_password=True
-        ):
+        )
+        cred = credential_diagnostics(Config.BTG_EMAIL, Config.BTG_PASSWORD, typed_password)
+        diagnostics.update(cred)
+
+        if not pw_ok:
             result = LoginResult(
-                LoginResult.UNKNOWN_LOGIN_FAILURE,
-                "Failed to populate password field (length mismatch)",
+                LoginResult.FORM_VALUE_MISMATCH,
+                "Password field value did not exactly match configured BTG_PASSWORD after typing",
             )
             _login_failure_alert(driver, result, diagnostics)
             return result
@@ -948,13 +1220,16 @@ def perform_login(driver):
             return result
 
         try:
+            WebDriverWait(driver, 10).until(
+                lambda d: submit_btn.is_displayed() and submit_btn.is_enabled()
+            )
             submit_btn.click()
-            print("  Login submitted by button click.")
+            print("  Login submitted through button click.")
         except (ElementClickInterceptedException, Exception) as click_err:
             print(f"  Normal click failed ({type(click_err).__name__}) — trying JS click")
             try:
                 driver.execute_script("arguments[0].click();", submit_btn)
-                print("  Login submitted by JS button click.")
+                print("  Login submitted through JS button click.")
             except Exception as js_err:
                 result = LoginResult(
                     LoginResult.UNKNOWN_LOGIN_FAILURE,
@@ -987,7 +1262,11 @@ def perform_login(driver):
             )
 
         diagnostics["visible_error"] = _collect_visible_login_errors(driver) or last_message
-        print(f"  Login result: {last_status}")
+        print(f"  Authentication response: {last_status}")
+        print(
+            f"  Configured and typed password values match: "
+            f"{diagnostics.get('password_values_match')}"
+        )
         print(f"❌ Login failed ({last_status}): {last_message}")
         result = LoginResult(last_status, last_message, details=dict(diagnostics))
         _login_failure_alert(driver, result, diagnostics)
@@ -2188,21 +2467,16 @@ def initialize_driver():
     prepare_chromedriver_log()
 
     options = Options()
-    if Config.HEADLESS:
+    # Diagnostic mode forces headed browser for login troubleshooting
+    use_headless = Config.HEADLESS and not Config.BTG_LOGIN_DIAGNOSTIC_MODE
+    if Config.BTG_LOGIN_DIAGNOSTIC_MODE:
+        print("  ⚠️ BTG_LOGIN_DIAGNOSTIC_MODE=true — headless disabled for diagnostics")
+    if use_headless:
         options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--remote-debugging-port=9222")
-    options.add_argument("--disable-setuid-sandbox")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    options.add_argument("--disable-gpu")
 
     chrome_bin = _find_binary("CHROME_BIN", [
         "/usr/bin/chromium",
@@ -2255,14 +2529,18 @@ def initialize_driver():
         )
         raise
 
-    driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    })
+    # Log native browser identity — no user-agent spoofing
+    browser_info = get_native_browser_info(driver)
+    print(f"  Native user-agent: {browser_info.get('userAgent') or '(unavailable)'}")
+    print(f"  Native platform: {browser_info.get('platform') or '(unavailable)'}")
+    print(f"  Native language: {browser_info.get('language') or '(unavailable)'}")
     return driver
 
 
 def setup_session(driver):
     """Try cookies first, fall back to login. Returns LoginResult."""
+    cookies_invalidated = False
+    browser_cleared = {}
     if load_cookies(driver):
         driver.get(Config.PROJECTS_URL)
         time.sleep(5)
@@ -2271,25 +2549,33 @@ def setup_session(driver):
         if "login" not in url and "sign" not in url:
             print("✅ Logged in via cookies")
             return LoginResult(LoginResult.SUCCESS, "Logged in via cookies")
-        print("  Cookies expired — logging in fresh...")
-        clear_stale_cookies()
+        print("  Cookies expired — invalidating saved session and clearing browser...")
+        cookies_invalidated = True
+        invalidate_saved_cookies()
+        browser_cleared = clear_btg_browser_session(driver)
         # Do not email merely because cookies expired if fresh login succeeds
 
-    return perform_login(driver)
+    return perform_login(
+        driver,
+        cookies_invalidated=cookies_invalidated,
+        browser_session_cleared=browser_cleared,
+    )
 
 
 # ============================
 # MAIN MONITORING LOOP
 # ============================
 def _alert_zero_projects(driver, streak):
-    png_path, html_path = "", ""
+    png_path, html_path, json_path = "", "", ""
     current_url = ""
     try:
         current_url = driver.current_url
     except Exception:
         pass
     try:
-        png_path, html_path = save_login_failure_evidence(driver, prefix="btg_zero_projects")
+        png_path, html_path, json_path = save_login_failure_evidence(
+            driver, prefix="btg_zero_projects"
+        )
     except Exception as e:
         print(f"  ⚠️ Zero-project evidence capture failed: {e}")
     send_error_notification(
@@ -2299,10 +2585,11 @@ def _alert_zero_projects(driver, streak):
             f"Projects page returned zero cards after retry.\n"
             f"URL: {current_url}\n"
             f"Screenshot: {png_path or 'n/a'}\n"
-            f"HTML: {html_path or 'n/a'}\n\n"
+            f"HTML: {html_path or 'n/a'}\n"
+            f"JSON: {json_path or 'n/a'}\n\n"
             f"Visible text (truncated):\n{_safe_page_text(driver, 1500)}"
         ),
-        attachments=[p for p in (png_path, html_path) if p],
+        attachments=[p for p in (png_path, html_path, json_path) if p],
         extra_rows=[
             ("Current URL", current_url),
             ("Consecutive failures", streak),
@@ -2369,10 +2656,16 @@ def run_monitoring_loop(driver):
             # If session expired, BTG silently redirects to /login — re-login immediately
             url = (driver.current_url or "").lower()
             if "login" in url or "sign" in url:
-                print("  ⚠️ Session expired — clearing stale cookies and re-logging in...")
-                clear_stale_cookies()
-                login_result = perform_login(driver)
+                print("  ⚠️ Session expired — clearing stale cookies/session and re-logging in...")
+                invalidate_saved_cookies()
+                browser_cleared = clear_btg_browser_session(driver)
+                login_result = perform_login(
+                    driver,
+                    cookies_invalidated=True,
+                    browser_session_cleared=browser_cleared,
+                )
                 if not login_result.ok:
+                    print(f"  Authentication response: {login_result.status}")
                     print(
                         f"  ❌ Re-login failed ({login_result.status}). "
                         f"Authentication unavailable. Next login attempt in "
@@ -2501,6 +2794,8 @@ def main():
     else:
         print("  Error alerts: NOT CONFIGURED (set error_recipent)")
     print(f"  Error cooldown: {Config.ERROR_EMAIL_COOLDOWN_MINUTES} minutes")
+    if Config.BTG_LOGIN_DIAGNOSTIC_MODE:
+        print("  Login diagnostic mode: ENABLED (headed browser)")
     print()
 
     if TEST_MODE:
