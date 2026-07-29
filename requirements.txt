@@ -1,12 +1,15 @@
 # Selenium for web automation
-selenium>=4.15.0
+selenium>=4.15.0,<5
 
-# Automatic chromedriver management (handles version mismatches in containers)
+# Automatic chromedriver management (local fallback when system driver absent)
 webdriver-manager>=4.0.0
 
 # Environment variable management
 python-dotenv>=1.0.0
 
 # MongoDB driver (Atlas cloud DB)
-pymongo>=4.0.0
+pymongo>=4.0.0,<5
 dnspython>=2.0.0
+
+# BTG auth preflight / connectivity checks
+requests>=2.31.0,<3

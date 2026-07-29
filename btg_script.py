@@ -5,11 +5,14 @@ import os
 import re
 import hashlib
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import traceback as traceback_mod
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pymongo import MongoClient, UpdateOne
 from datetime import datetime, timezone, timedelta
 from email import encoders
@@ -26,6 +29,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from dotenv import load_dotenv
 
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None
+
 # Load .env file from this script's directory
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -34,6 +42,34 @@ PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
 # ============================
 # CONFIGURATION
 # ============================
+def _env_bool(name, default="false"):
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_evidence_dir():
+    volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if volume:
+        path = os.path.join(volume, "evidence")
+    else:
+        path = os.getenv("EVIDENCE_DIR", "/tmp/btg-evidence")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        path = tempfile.gettempdir()
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _resolve_cookie_file():
+    explicit = os.getenv("COOKIE_FILE") or os.getenv("BTG_COOKIES_FILE")
+    if explicit:
+        return explicit
+    volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if volume:
+        return os.path.join(volume, "btg_cookies.json")
+    return "/tmp/btg_cookies.json"
+
+
 class Config:
     BTG_EMAIL    = os.getenv("BTG_EMAIL")
     BTG_PASSWORD = os.getenv("BTG_PASSWORD")
@@ -65,21 +101,38 @@ class Config:
     LOGIN_RETRY_INTERVAL = int(os.getenv("LOGIN_RETRY_INTERVAL", "300"))
     CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", 60))
     MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", 60))
-    HEADLESS     = os.getenv("HEADLESS", "False").lower() == "true"
-    # When true: disable headless for login diagnostics only (not for production)
-    BTG_LOGIN_DIAGNOSTIC_MODE = (
-        os.getenv("BTG_LOGIN_DIAGNOSTIC_MODE", "false").lower() == "true"
+    REPOST_MIN_DAYS = int(os.getenv("REPOST_MIN_DAYS", "3"))
+    HEADLESS     = _env_bool("HEADLESS", "False")
+    BTG_LOGIN_DIAGNOSTIC_MODE = _env_bool("BTG_LOGIN_DIAGNOSTIC_MODE", "false")
+    BTG_CLEAR_SESSION_ON_START = _env_bool("BTG_CLEAR_SESSION_ON_START", "false")
+    BTG_CAPTURE_NETWORK_LOGS = _env_bool("BTG_CAPTURE_NETWORK_LOGS", "false")
+    BTG_PAUSE_AFTER_LOGIN_FAILURE = _env_bool("BTG_PAUSE_AFTER_LOGIN_FAILURE", "false")
+
+    # Preflight / Railway
+    BTG_PREFLIGHT_ENABLED = _env_bool(
+        "BTG_PREFLIGHT_ENABLED",
+        "true" if (
+            os.getenv("RAILWAY_ENVIRONMENT")
+            or os.getenv("RAILWAY_SERVICE_ID")
+            or os.getenv("RAILWAY_PROJECT_ID")
+        ) else "false",
     )
-    BTG_CLEAR_SESSION_ON_START = (
-        os.getenv("BTG_CLEAR_SESSION_ON_START", "false").lower() == "true"
+    BTG_PREFLIGHT_URL = os.getenv(
+        "BTG_PREFLIGHT_URL",
+        "https://api.businesstalentgroup.com/auth/sign_in",
     )
-    BTG_CAPTURE_NETWORK_LOGS = (
-        os.getenv("BTG_CAPTURE_NETWORK_LOGS", "false").lower() == "true"
+    BTG_PREFLIGHT_TIMEOUT = int(os.getenv("BTG_PREFLIGHT_TIMEOUT", "30"))
+    BTG_PREFLIGHT_FAILURE_RETRY_SECONDS = int(
+        os.getenv("BTG_PREFLIGHT_FAILURE_RETRY_SECONDS", "1800")
     )
-    BTG_PAUSE_AFTER_LOGIN_FAILURE = (
-        os.getenv("BTG_PAUSE_AFTER_LOGIN_FAILURE", "false").lower() == "true"
-    )
-    COOKIES_FILE = os.getenv("BTG_COOKIES_FILE", "btg_cookies.json")
+    CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+    CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+    EVIDENCE_DIR = _resolve_evidence_dir()
+    EVIDENCE_RETENTION_HOURS = int(os.getenv("EVIDENCE_RETENTION_HOURS", "24"))
+    COOKIES_FILE = _resolve_cookie_file()
+    BTG_WORKER_LOCK_ENABLED = _env_bool("BTG_WORKER_LOCK_ENABLED", "true")
+    BTG_WORKER_LOCK_TTL_SECONDS = int(os.getenv("BTG_WORKER_LOCK_TTL_SECONDS", "180"))
+    HEALTH_PORT = int(os.getenv("PORT", "8080"))
     MONGO_URI    = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 
     # BTG URLs
@@ -95,6 +148,8 @@ ONCE_MODE  = "--once"  in sys.argv  # Run one check then exit (for testing)
 TEST_MODE  = "--test"  in sys.argv  # Skip MongoDB, send 1 test email only
 TEST_ERROR_EMAIL_MODE = "--test-error-email" in sys.argv
 TEST_BTG_LOGIN_MODE = "--test-btg-login" in sys.argv
+TEST_BTG_PREFLIGHT_MODE = "--test-btg-preflight" in sys.argv
+PRINT_RUNTIME_DIAGNOSTICS_MODE = "--print-runtime-diagnostics" in sys.argv
 CHROMEDRIVER_LOG_PATH = "/tmp/chromedriver.log"
 
 # Runtime state for operational alerts (never stores secrets)
@@ -103,6 +158,87 @@ _sending_error_email = False
 _monitor_check_count = 0
 _zero_project_streak = 0
 _browser_versions_cache = None
+_chrome_profile_dir = None
+shutdown_event = threading.Event()
+_health_server = None
+_worker_lock_owner = None
+
+_monitor_state = {
+    "status": "ok",
+    "service": "btg-project-monitor",
+    "process_alive": True,
+    "monitor_state": "starting",
+    "last_successful_scan": None,
+    "last_login_result": None,
+    "last_preflight": None,
+    "timestamp": None,
+}
+_monitor_state_lock = threading.Lock()
+
+
+def set_monitor_state(state, **extra):
+    with _monitor_state_lock:
+        _monitor_state["monitor_state"] = state
+        _monitor_state["timestamp"] = datetime.now(PKT).isoformat()
+        for k, v in extra.items():
+            _monitor_state[k] = v
+
+
+def get_monitor_state_snapshot():
+    with _monitor_state_lock:
+        snap = dict(_monitor_state)
+    snap["timestamp"] = datetime.now(PKT).isoformat()
+    return snap
+
+
+def interruptible_sleep(seconds):
+    """Sleep that wakes early on SIGTERM/SIGINT via shutdown_event."""
+    return shutdown_event.wait(timeout=max(0, float(seconds)))
+
+
+def is_railway_environment():
+    return bool(
+        os.getenv("RAILWAY_ENVIRONMENT")
+        or os.getenv("RAILWAY_SERVICE_ID")
+        or os.getenv("RAILWAY_PROJECT_ID")
+    )
+
+
+def railway_metadata():
+    return {
+        "environment": os.getenv("RAILWAY_ENVIRONMENT", ""),
+        "service": os.getenv("RAILWAY_SERVICE_NAME", "") or os.getenv("RAILWAY_SERVICE_ID", ""),
+        "region": os.getenv("RAILWAY_REGION", "") or os.getenv("RAILWAY_REPLICA_REGION", ""),
+        "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID", ""),
+        "project_id": os.getenv("RAILWAY_PROJECT_ID", ""),
+    }
+
+
+def log_event(severity, event, classification="", **fields):
+    ts = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S PKT")
+    meta = railway_metadata()
+    parts = [
+        f"ts={ts}",
+        f"severity={severity}",
+        f"event={event}",
+    ]
+    if classification:
+        parts.append(f"classification={classification}")
+    if meta.get("deployment_id"):
+        parts.append(f"railway_deployment={meta['deployment_id']}")
+    for k, v in fields.items():
+        if v is None or v == "":
+            continue
+        parts.append(f"{k}={v}")
+    print(" | ".join(parts), flush=True)
+
+
+def worker_owner_id():
+    return (
+        os.getenv("RAILWAY_DEPLOYMENT_ID")
+        or os.getenv("RAILWAY_REPLICA_ID")
+        or socket.gethostname()
+    )
 
 def debug_print(msg):
     if DEBUG_MODE:
@@ -181,6 +317,9 @@ class LoginResult:
     SUCCESS = "SUCCESS"
     INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
     INVALID_CREDENTIALS_RESPONSE = "INVALID_CREDENTIALS_RESPONSE"
+    CORS_PREFLIGHT_FAILED = "CORS_PREFLIGHT_FAILED"
+    BTG_EDGE_403 = "BTG_EDGE_403"
+    BTG_RATE_LIMITED = "BTG_RATE_LIMITED"
     HTTP_401 = "HTTP_401"
     HTTP_403 = "HTTP_403"
     HTTP_429 = "HTTP_429"
@@ -198,6 +337,9 @@ class LoginResult:
     AUTH_BLOCKERS = {
         INVALID_CREDENTIALS,
         INVALID_CREDENTIALS_RESPONSE,
+        CORS_PREFLIGHT_FAILED,
+        BTG_EDGE_403,
+        BTG_RATE_LIMITED,
         HTTP_401,
         HTTP_403,
         HTTP_429,
@@ -344,23 +486,350 @@ def empty_session_cleanup_status():
     }
 
 
-def _safe_quit(driver):
-    if not driver:
+# ============================
+# HEALTH SERVER / PREFLIGHT / LOCK
+# ============================
+class _QuietHealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):  # noqa: A003
+        return
+
+    def do_GET(self):
+        if self.path.split("?")[0] != "/health":
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"not_found"}')
+            return
+        payload = get_monitor_state_snapshot()
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def start_health_server():
+    global _health_server
+    port = Config.HEALTH_PORT
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), _QuietHealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
+        thread.start()
+        _health_server = server
+        log_event("INFO", "health_server_started", port=port)
+        return server
+    except Exception as e:
+        log_event("ERROR", "health_server_failed", message=str(e))
+        return None
+
+
+def stop_health_server():
+    global _health_server
+    if _health_server is None:
         return
     try:
-        driver.quit()
+        _health_server.shutdown()
     except Exception:
         pass
+    _health_server = None
+
+
+def request_shutdown(signum=None, frame=None):
+    log_event("INFO", "shutdown_requested", signal=signum)
+    set_monitor_state("shutting_down")
+    shutdown_event.set()
+
+
+def install_signal_handlers():
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, request_shutdown)
+        except Exception:
+            pass
+
+
+def validate_configuration():
+    """Return (ok, missing_names). Never prints secret values."""
+    required = {
+        "BTG_EMAIL": Config.BTG_EMAIL,
+        "BTG_PASSWORD": Config.BTG_PASSWORD,
+        "MONGO_URI": Config.MONGO_URI,
+        "SMTP_SERVER": Config.SMTP_SERVER,
+        "SMTP_PORT": str(Config.SMTP_PORT) if Config.SMTP_PORT else "",
+        "SENDER_EMAIL": Config.SENDER_EMAIL,
+        "SENDER_PASSWORD": Config.SENDER_PASSWORD,
+        "RECIPIENT_EMAILS": ",".join(Config.RECIPIENT_EMAILS),
+        "error_recipent": ",".join(Config.ERROR_RECIPIENTS),
+    }
+    missing = [name for name, val in required.items() if not (val or "").strip()]
+    return (len(missing) == 0), missing
+
+
+def cleanup_old_evidence():
+    """Delete evidence files older than EVIDENCE_RETENTION_HOURS."""
+    root = Config.EVIDENCE_DIR
+    try:
+        cutoff = time.time() - max(Config.EVIDENCE_RETENTION_HOURS, 1) * 3600
+        removed = 0
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            if not name.startswith("btg_"):
+                continue
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            log_event("INFO", "evidence_cleanup", removed=removed)
+    except Exception as e:
+        log_event("WARN", "evidence_cleanup_failed", message=str(e))
+
+
+def check_btg_auth_preflight():
+    """Safe OPTIONS preflight to BTG auth API. Never sends credentials."""
+    url = Config.BTG_PREFLIGHT_URL
+    started = time.time()
+    result = {
+        "ok": False,
+        "classification": "BTG_PREFLIGHT_UNKNOWN",
+        "status": None,
+        "server": None,
+        "allow_origin": None,
+        "location": None,
+        "elapsed_ms": 0,
+        "message": "",
+    }
+    if requests is None:
+        result["classification"] = "BTG_NETWORK_ERROR"
+        result["message"] = "requests package is not installed"
+        return result
+
+    headers = {
+        "Origin": "https://talent.businesstalentgroup.com",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+        "User-Agent": "BTG-Monitor-Connectivity-Check/1.0",
+    }
+    try:
+        resp = requests.options(
+            url,
+            headers=headers,
+            timeout=Config.BTG_PREFLIGHT_TIMEOUT,
+            allow_redirects=False,
+        )
+        result["status"] = resp.status_code
+        result["server"] = resp.headers.get("server") or resp.headers.get("Server")
+        result["allow_origin"] = (
+            resp.headers.get("access-control-allow-origin")
+            or resp.headers.get("Access-Control-Allow-Origin")
+        )
+        result["location"] = resp.headers.get("location") or resp.headers.get("Location")
+        result["elapsed_ms"] = int((time.time() - started) * 1000)
+
+        status = resp.status_code
+        if status in (200, 204):
+            ao = (result["allow_origin"] or "").strip()
+            if ao in ("*", "https://talent.businesstalentgroup.com"):
+                result["ok"] = True
+                result["classification"] = "BTG_PREFLIGHT_OK"
+                result["message"] = "Preflight succeeded with CORS allow-origin"
+            else:
+                result["classification"] = "BTG_CORS_HEADERS_MISSING"
+                result["message"] = "Preflight returned success status but Access-Control-Allow-Origin missing/unexpected"
+        elif status == 403:
+            result["classification"] = "BTG_EDGE_403"
+            result["message"] = (
+                "BTG's edge layer returned HTTP 403 to the authentication preflight "
+                "request. Credentials were not sent and Selenium login should be skipped."
+            )
+        elif status == 429:
+            result["classification"] = "BTG_RATE_LIMITED"
+            result["message"] = "BTG rate-limited the authentication preflight (HTTP 429)"
+        elif 500 <= status <= 599:
+            result["classification"] = "BTG_SERVER_ERROR"
+            result["message"] = f"BTG auth API returned HTTP {status}"
+        elif status in (301, 302, 303, 307, 308):
+            result["classification"] = "BTG_PREFLIGHT_REDIRECT"
+            result["message"] = f"Preflight redirected to {result['location'] or '(unknown)'}"
+        else:
+            result["classification"] = "BTG_PREFLIGHT_UNKNOWN"
+            result["message"] = f"Unexpected preflight status {status}"
+    except Exception as e:
+        result["elapsed_ms"] = int((time.time() - started) * 1000)
+        result["classification"] = "BTG_NETWORK_ERROR"
+        result["message"] = f"Preflight network error: {e}"
+
+    log_event(
+        "INFO" if result["ok"] else "WARN",
+        "btg_preflight",
+        classification=result["classification"],
+        status=result["status"],
+        server=result["server"],
+        elapsed_ms=result["elapsed_ms"],
+    )
+    return result
+
+
+def acquire_worker_lock():
+    """MongoDB lease so only one replica scans. Returns True if this process owns the lock."""
+    global _worker_lock_owner
+    if not Config.BTG_WORKER_LOCK_ENABLED:
+        return True
+    owner = worker_owner_id()
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=Config.BTG_WORKER_LOCK_TTL_SECONDS)
+    coll = _get_session_collection().database["worker_locks"]
+    try:
+        doc = coll.find_one({"_id": "btg_monitor_worker_lock"})
+        if doc:
+            exp = doc.get("expires_at")
+            if isinstance(exp, datetime) and exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp and exp > now and doc.get("owner") != owner:
+                log_event(
+                    "WARN",
+                    "worker_lock_held",
+                    owner=doc.get("owner"),
+                    expires_at=str(exp),
+                )
+                return False
+        coll.update_one(
+            {"_id": "btg_monitor_worker_lock"},
+            {"$set": {
+                "owner": owner,
+                "expires_at": expires,
+                "heartbeat_at": now,
+            }},
+            upsert=True,
+        )
+        _worker_lock_owner = owner
+        return True
+    except Exception as e:
+        log_event("ERROR", "worker_lock_acquire_failed", message=str(e))
+        # Fail open for availability if lock store is down
+        return True
+
+
+def renew_worker_lock():
+    if not Config.BTG_WORKER_LOCK_ENABLED or not _worker_lock_owner:
+        return
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=Config.BTG_WORKER_LOCK_TTL_SECONDS)
+    try:
+        coll = _get_session_collection().database["worker_locks"]
+        coll.update_one(
+            {"_id": "btg_monitor_worker_lock", "owner": _worker_lock_owner},
+            {"$set": {"expires_at": expires, "heartbeat_at": now}},
+        )
+    except Exception as e:
+        log_event("WARN", "worker_lock_renew_failed", message=str(e))
+
+
+def release_worker_lock():
+    global _worker_lock_owner
+    if not Config.BTG_WORKER_LOCK_ENABLED or not _worker_lock_owner:
+        return
+    try:
+        coll = _get_session_collection().database["worker_locks"]
+        coll.delete_one({"_id": "btg_monitor_worker_lock", "owner": _worker_lock_owner})
+    except Exception as e:
+        log_event("WARN", "worker_lock_release_failed", message=str(e))
+    _worker_lock_owner = None
+
+
+def alert_preflight_failure(preflight):
+    classification = preflight.get("classification")
+    if classification == "BTG_EDGE_403":
+        message = (
+            "BTG's edge layer returned HTTP 403 to the authentication preflight "
+            "request from the Railway deployment. Credentials were not sent and "
+            "Selenium login was skipped."
+        )
+    else:
+        message = preflight.get("message") or classification
+    set_monitor_state(
+        "degraded",
+        last_preflight=preflight,
+        status="degraded",
+    )
+    send_error_notification(
+        f"BTG_PREFLIGHT:{classification}",
+        message,
+        details=(
+            "BTG authentication was not attempted because the safe OPTIONS preflight failed.\n"
+            "Credentials were not sent.\n\n"
+            f"classification={classification}\n"
+            f"status={preflight.get('status')}\n"
+            f"server={preflight.get('server')}\n"
+            f"allow_origin={preflight.get('allow_origin')}\n"
+            f"location={preflight.get('location')}\n"
+            f"elapsed_ms={preflight.get('elapsed_ms')}\n"
+        ),
+    )
+
+
+def print_runtime_diagnostics():
+    versions = get_browser_versions()
+    meta = railway_metadata()
+    ok, missing = validate_configuration()
+    print("=" * 60)
+    print("BTG runtime diagnostics")
+    print("=" * 60)
+    print(f"Python version: {sys.version.split()[0]}")
+    print(f"Chromium path: {Config.CHROME_BIN}")
+    print(f"Chromium version: {versions.get('chromium')}")
+    print(f"ChromeDriver path: {Config.CHROMEDRIVER_PATH}")
+    print(f"ChromeDriver version: {versions.get('chromedriver')}")
+    print(f"Railway detected: {is_railway_environment()}")
+    print(f"Railway environment: {meta.get('environment') or '(none)'}")
+    print(f"Railway service: {meta.get('service') or '(none)'}")
+    print(f"Railway region: {meta.get('region') or '(none)'}")
+    print(f"Railway deployment: {meta.get('deployment_id') or '(none)'}")
+    print(f"PORT: {Config.HEALTH_PORT}")
+    print(f"MongoDB configured: {'yes' if Config.MONGO_URI else 'no'}")
+    print(f"SMTP configured: {'yes' if Config.SENDER_EMAIL and Config.SENDER_PASSWORD else 'no'}")
+    print(f"BTG email configured: {'yes' if Config.BTG_EMAIL else 'no'}")
+    print(f"Error recipients configured: {'yes' if Config.ERROR_RECIPIENTS else 'no'}")
+    print(f"Headless mode: {Config.HEADLESS and not Config.BTG_LOGIN_DIAGNOSTIC_MODE}")
+    print(f"Preflight enabled: {Config.BTG_PREFLIGHT_ENABLED}")
+    print(f"Evidence dir: {Config.EVIDENCE_DIR}")
+    print(f"Cookie file: {Config.COOKIES_FILE}")
+    print(f"Config valid: {ok}")
+    if missing:
+        print(f"Missing variables: {', '.join(missing)}")
+    print("=" * 60)
+
+
+def run_test_btg_preflight():
+    print("=" * 60)
+    print("BTG auth preflight test (--test-btg-preflight)")
+    print("=" * 60)
+    result = check_btg_auth_preflight()
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("ok") else 1
 
 
 def _evidence_dir():
-    for path in ("/tmp", tempfile.gettempdir()):
-        try:
-            os.makedirs(path, exist_ok=True)
-            return path
-        except Exception:
-            continue
-    return tempfile.gettempdir()
+    path = Config.EVIDENCE_DIR
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:
+        fallback = tempfile.gettempdir()
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+def _cookie_file_path():
+    path = Config.COOKIES_FILE
+    if os.path.isabs(path):
+        return path
+    return os.path.join(os.path.dirname(__file__), path)
 
 
 def get_browser_versions():
@@ -403,15 +872,27 @@ def create_error_email_html(
     versions = get_browser_versions()
     hostname = socket.gethostname()
     now = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S PKT")
+    meta = railway_metadata()
+    snap = get_monitor_state_snapshot()
+    preflight = snap.get("last_preflight") or {}
     rows = [
         ("Context", _html_esc(context)),
         ("Exception", f"{_html_esc(err_type)}: {err_msg}"),
         ("Timestamp", _html_esc(now)),
         ("Hostname", _html_esc(hostname)),
+        ("Railway environment", _html_esc(meta.get("environment") or "(none)")),
+        ("Railway service", _html_esc(meta.get("service") or "(none)")),
+        ("Railway region", _html_esc(meta.get("region") or "(none)")),
+        ("Railway deployment ID", _html_esc(meta.get("deployment_id") or "(none)")),
         ("Check #", str(_monitor_check_count or "—")),
+        ("Monitor state", _html_esc(str(snap.get("monitor_state") or ""))),
         ("Headless", str(Config.HEADLESS)),
-        ("Chromium", _html_esc(versions.get("chromium", "unknown"))),
-        ("ChromeDriver", _html_esc(versions.get("chromedriver", "unknown"))),
+        ("Native Chromium version", _html_esc(versions.get("chromium", "unknown"))),
+        ("ChromeDriver version", _html_esc(versions.get("chromedriver", "unknown"))),
+        ("Preflight classification", _html_esc(str(preflight.get("classification") or "(n/a)"))),
+        ("Preflight HTTP status", _html_esc(str(preflight.get("status") if preflight else "(n/a)"))),
+        ("Preflight server header", _html_esc(str(preflight.get("server") or "(n/a)"))),
+        ("Preflight allow-origin", _html_esc(str(preflight.get("allow_origin") or "(n/a)"))),
     ]
     for label, value in (extra_rows or []):
         if value is not None and str(value) != "":
@@ -735,10 +1216,10 @@ def _safe_page_text(driver, limit=2000):
     return text[:limit]
 
 
-def _classify_login_outcome(driver, auth_network_responses=None):
+def _classify_login_outcome(driver, auth_network_responses=None, console_entries=None):
     """Return (status, message) or (None, '') if still indeterminate.
 
-    Priority: CAPTCHA/MFA → success → HTTP auth status → visible BTG error → unknown.
+    Priority: CORS/EDGE → CAPTCHA/MFA → success → HTTP auth status → visible BTG error → unknown.
     """
     url = (driver.current_url or "").lower()
     try:
@@ -751,6 +1232,36 @@ def _classify_login_outcome(driver, auth_network_responses=None):
     error_l = (error_text or "").lower()
     combined = f"{body}\n{error_l}"
     auth_network_responses = auth_network_responses or []
+    console_blob = "\n".join(
+        str(e.get("message", "")).lower() for e in (console_entries or [])
+    )
+
+    # CORS / edge failure from browser console — do NOT treat as credential failure
+    if (
+        "blocked by cors policy" in console_blob
+        and "api.businesstalentgroup.com/auth/sign_in" in console_blob
+    ) or (
+        "api.businesstalentgroup.com/auth/sign_in" in console_blob
+        and "net::err_failed" in console_blob
+    ):
+        return LoginResult.CORS_PREFLIGHT_FAILED, (
+            "BTG authentication was not completed because the browser's preflight "
+            "request to the BTG authentication API failed. The visible credential "
+            "message may be a generic or stale UI response."
+        )
+
+    for resp in auth_network_responses:
+        try:
+            status = int(resp.get("status")) if resp.get("status") is not None else None
+        except (TypeError, ValueError):
+            status = None
+        if status == 403 and "auth/sign_in" in (resp.get("url") or "").lower():
+            return LoginResult.BTG_EDGE_403, (
+                "BTG edge/WAF returned HTTP 403 for auth/sign_in. "
+                "This is not proof that credentials are wrong."
+            )
+        if status == 429:
+            return LoginResult.BTG_RATE_LIMITED, f"Auth HTTP 429 for {resp.get('url', '')}"
 
     captcha_phrases = ("captcha", "verify you are human", "recaptcha", "hcaptcha", "bot detection")
     if any(p in combined for p in captcha_phrases) or "captcha" in url:
@@ -797,7 +1308,7 @@ def _classify_login_outcome(driver, auth_network_responses=None):
         if status == 403:
             return LoginResult.HTTP_403, f"Auth HTTP 403 for {resp.get('url', '')}"
         if status == 429:
-            return LoginResult.HTTP_429, f"Auth HTTP 429 (rate limited) for {resp.get('url', '')}"
+            return LoginResult.HTTP_429, f"Auth HTTP 429 for {resp.get('url', '')}"
         if status is not None and 500 <= status <= 599:
             return LoginResult.HTTP_5XX, f"Auth HTTP {status} for {resp.get('url', '')}"
 
@@ -814,6 +1325,7 @@ def _classify_login_outcome(driver, auth_network_responses=None):
     )
     something_wrong = "something went wrong, please try again later" in combined
     if invalid_combo:
+        # If console suggests CORS, that already returned above. Otherwise keep nuance.
         msg = (
             "BTG returned INVALID_CREDENTIALS_RESPONSE "
             "('can't find that email address and password combination'). "
@@ -981,7 +1493,7 @@ def save_cookies(driver):
         )
     # Local file fallback
     try:
-        path = os.path.join(os.path.dirname(__file__), Config.COOKIES_FILE)
+        path = _cookie_file_path()
         with open(path, 'w') as f:
             json.dump(cookies, f)
     except Exception as e:
@@ -1007,7 +1519,7 @@ def load_cookies(driver):
         )
     # Fall back to local file
     if not cookies:
-        path = os.path.join(os.path.dirname(__file__), Config.COOKIES_FILE)
+        path = _cookie_file_path()
         if os.path.exists(path):
             try:
                 with open(path, 'r') as f:
@@ -1062,7 +1574,7 @@ def invalidate_saved_btg_session(driver=None):
 
     # 2) Local cookie file
     try:
-        path = os.path.join(os.path.dirname(__file__), Config.COOKIES_FILE)
+        path = _cookie_file_path()
         if os.path.exists(path):
             os.remove(path)
             status["local_cookie_file_deleted"] = True
@@ -1535,20 +2047,25 @@ def perform_login(driver, cookies_invalidated=False, browser_session_cleared=Non
                 print(f"  ⚠️ Auth network collection failed: {e}")
         diagnostics["auth_network_responses"] = auth_network
 
-        # Re-classify with network status priority
-        status, message = _classify_login_outcome(driver, auth_network)
-        if status == LoginResult.SUCCESS:
-            save_cookies(driver)
-            print(f"  Login result: {LoginResult.SUCCESS}")
-            print(f"✅ Login successful → {driver.current_url}")
-            return LoginResult(LoginResult.SUCCESS, message, details=dict(diagnostics))
-        if status is not None:
-            last_status, last_message = status, message
-
         try:
             diagnostics["browser_console_entries"] = collect_browser_console_diagnostics(driver)
         except Exception:
             diagnostics["browser_console_entries"] = []
+
+        # Re-classify with network + console priority (CORS before credential message)
+        status, message = _classify_login_outcome(
+            driver,
+            auth_network,
+            diagnostics.get("browser_console_entries") or [],
+        )
+        if status == LoginResult.SUCCESS:
+            save_cookies(driver)
+            print(f"  Login result: {LoginResult.SUCCESS}")
+            print(f"✅ Login successful → {driver.current_url}")
+            set_monitor_state("authenticated", last_login_result=LoginResult.SUCCESS)
+            return LoginResult(LoginResult.SUCCESS, message, details=dict(diagnostics))
+        if status is not None:
+            last_status, last_message = status, message
 
         diagnostics["visible_error"] = _collect_visible_login_errors(driver) or last_message
         print(f"  Authentication response: {last_status}")
@@ -1557,6 +2074,7 @@ def perform_login(driver, cookies_invalidated=False, browser_session_cleared=Non
             f"{diagnostics.get('password_values_match')}"
         )
         print(f"❌ Login failed ({last_status}): {last_message}")
+        set_monitor_state("degraded", last_login_result=last_status)
         result = LoginResult(last_status, last_message, details=dict(diagnostics))
         _login_failure_alert(
             driver,
@@ -1564,6 +2082,7 @@ def perform_login(driver, cookies_invalidated=False, browser_session_cleared=Non
             diagnostics,
             evidence_prefix="btg_local_login" if TEST_BTG_LOGIN_MODE else "btg_login_failure",
         )
+        cleanup_old_evidence()
         return result
 
     except TimeoutException as e:
@@ -2084,8 +2603,19 @@ def _normalize_posted_date(time_str):
     return ""
 
 
+def _parse_posted_date(time_str):
+    """Return a calendar date for a BTG posted-date value, or None."""
+    normalized = _normalize_posted_date(time_str)
+    if not normalized:
+        return None
+    try:
+        return datetime.strptime(normalized, "%m/%d/%Y").date()
+    except ValueError:
+        return None
+
+
 def make_dedupe_key(project_id, time_posted):
-    """Dedupe key = project_id + posted date, so re-posts count as new."""
+    """Unique occurrence key; project_id itself remains non-unique."""
     if not project_id:
         return ""
     date = _normalize_posted_date(time_posted)
@@ -2119,23 +2649,41 @@ def db_is_cold_start():
     """True if the collection has no documents (first ever run)."""
     return _get_collection().find_one({}, {"_id": 1}) is None
 
-def get_seen_ids():
-    """Return set of dedupe keys (project_id + posted date) already in DB."""
+def get_project_history():
+    """Return exact keys, known IDs, and latest parsed date for each ID."""
     try:
         docs = _get_collection().find(
             {}, {"project_id": 1, "time_posted": 1, "dedupe_key": 1, "_id": 0}
         )
         keys = set()
+        known_ids = set()
+        latest_by_id = {}
         for d in docs:
+            project_id = d.get("project_id")
+            if not project_id:
+                continue
+            known_ids.add(project_id)
+
             # Older docs lack dedupe_key — rebuild it from stored fields
             key = d.get("dedupe_key") or make_dedupe_key(
-                d.get("project_id"), d.get("time_posted")
+                project_id, d.get("time_posted")
             )
             if key:
                 keys.add(key)
-        return keys
-    except Exception:
-        return set()
+
+            posted_date = _parse_posted_date(d.get("time_posted"))
+            current_latest = latest_by_id.get(project_id)
+            if posted_date and (current_latest is None or posted_date > current_latest):
+                latest_by_id[project_id] = posted_date
+        return keys, known_ids, latest_by_id
+    except Exception as e:
+        print(f"DB project-history load failed: {e}")
+        raise
+
+
+def get_seen_ids():
+    """Compatibility helper returning occurrence keys already in DB."""
+    return get_project_history()[0]
 
 def insert_project(project, emailed=True):
     """Upsert one project record keyed on dedupe_key (id + posted date)."""
@@ -2196,8 +2744,10 @@ def bulk_insert_projects(projects, emailed=False):
         if ops:
             result = _get_collection().bulk_write(ops, ordered=False)
             print(f"  DB: inserted {result.upserted_count} records (emailed={'yes' if emailed else 'no'})")
+        return True
     except Exception as e:
         print(f"⚠️ DB bulk insert failed: {e}")
+        return False
 
 
 # ============================
@@ -2249,19 +2799,55 @@ def parse_posted_minutes(time_str):
     return None
 
 
-def filter_new_projects(all_projects, seen_ids):
-    """Keep projects whose dedupe key (id + posted date) is unseen.
-    No age filtering: every unseen project is emailed and stored.
-    A re-post (same id, new posted date) counts as new again.
+def filter_new_projects(all_projects, seen_ids, known_ids=None, latest_by_id=None):
+    """Keep first-seen IDs and re-posts newer than the configured day gap.
+
+    ``project_id`` is the conditional lookup key. ``dedupe_key`` remains the
+    unique occurrence key, preventing duplicate alerts for the same ID/date.
     """
+    known_ids = known_ids if known_ids is not None else set()
+    latest_by_id = latest_by_id if latest_by_id is not None else {}
+    comparison_keys = set(seen_ids)
+    comparison_ids = set(known_ids)
+    comparison_latest = dict(latest_by_id)
     result = []
     for p in all_projects:
-        if not p.get("id"):
+        project_id = p.get("id")
+        if not project_id:
             continue
-        key = make_dedupe_key(p["id"], p.get("time_posted", ""))
-        if key in seen_ids:
+
+        posted_value = p.get("time_posted", "")
+        key = make_dedupe_key(project_id, posted_value)
+        if key in comparison_keys:
             continue
-        result.append(p)
+
+        current_date = _parse_posted_date(posted_value)
+        if project_id not in comparison_ids:
+            result.append(p)
+            comparison_keys.add(key)
+            comparison_ids.add(project_id)
+            if current_date:
+                comparison_latest[project_id] = current_date
+            continue
+
+        latest_date = comparison_latest.get(project_id)
+        if current_date is None or latest_date is None:
+            print(
+                f"  Skipping known project {project_id}: "
+                "posted date cannot be compared safely"
+            )
+            continue
+
+        gap_days = (current_date - latest_date).days
+        if gap_days > Config.REPOST_MIN_DAYS:
+            result.append(p)
+            comparison_keys.add(key)
+            comparison_latest[project_id] = current_date
+        elif DEBUG_MODE:
+            print(
+                f"  Skipping project {project_id}: repost gap is "
+                f"{gap_days} day(s), requires > {Config.REPOST_MIN_DAYS}"
+            )
     return result
 
 
@@ -2757,11 +3343,11 @@ def create_chromedriver_service(driver_path=""):
 
 
 def initialize_driver():
+    global _chrome_profile_dir
     print_browser_startup_diagnostics()
     prepare_chromedriver_log()
 
     options = Options()
-    # Diagnostic mode forces headed browser for login troubleshooting
     use_headless = Config.HEADLESS and not Config.BTG_LOGIN_DIAGNOSTIC_MODE
     if Config.BTG_LOGIN_DIAGNOSTIC_MODE:
         print("  Local diagnostic mode is active (headed Chrome)")
@@ -2770,11 +3356,18 @@ def initialize_driver():
         options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-software-rasterizer")
     if Config.BTG_LOGIN_DIAGNOSTIC_MODE:
         options.add_argument("--window-size=1440,1000")
     else:
         options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-gpu")
+
+    # Unique temp profile per browser instance (Railway ephemeral FS safe)
+    _chrome_profile_dir = tempfile.mkdtemp(prefix="btg-chrome-")
+    options.add_argument(f"--user-data-dir={_chrome_profile_dir}")
 
     if Config.BTG_CAPTURE_NETWORK_LOGS or TEST_BTG_LOGIN_MODE:
         options.set_capability("goog:loggingPrefs", {
@@ -2784,6 +3377,7 @@ def initialize_driver():
         print("  Chrome performance/browser logs enabled")
 
     chrome_bin = _find_binary("CHROME_BIN", [
+        Config.CHROME_BIN,
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome",
@@ -2793,10 +3387,8 @@ def initialize_driver():
         options.binary_location = chrome_bin
         print(f"  Chrome binary: {chrome_bin}")
 
-    from selenium.webdriver.chrome.service import Service
-
-    # Primary: system chromedriver — apt installs chromium-driver version-matched to chromium
     system_path = _find_binary("CHROMEDRIVER_PATH", [
+        Config.CHROMEDRIVER_PATH,
         "/usr/bin/chromedriver",
         "/usr/lib/chromium/chromedriver",
         "/usr/lib/chromium-browser/chromedriver",
@@ -2805,7 +3397,6 @@ def initialize_driver():
         service = create_chromedriver_service(system_path)
         print(f"  Chromedriver (system): {system_path}")
     else:
-        # Fallback: webdriver-manager (downloads matching chromedriver)
         try:
             from webdriver_manager.chrome import ChromeDriverManager
             from webdriver_manager.core.os_manager import ChromeType
@@ -2822,6 +3413,7 @@ def initialize_driver():
         driver = webdriver.Chrome(service=service, options=options)
     except Exception as e:
         print_chromedriver_log()
+        _cleanup_chrome_profile()
         send_error_notification(
             "BROWSER_INIT_FAILURE",
             e,
@@ -2846,13 +3438,34 @@ def initialize_driver():
         except Exception:
             pass
 
-    # Log native browser identity — no user-agent spoofing
     browser_info = get_native_browser_info(driver)
     print(f"  Native user-agent: {browser_info.get('userAgent') or '(unavailable)'}")
     print(f"  Native platform: {browser_info.get('platform') or '(unavailable)'}")
     print(f"  Native language: {browser_info.get('language') or '(unavailable)'}")
     print(f"  navigator.webdriver: {browser_info.get('webdriver')}")
     return driver
+
+
+def _cleanup_chrome_profile():
+    global _chrome_profile_dir
+    if not _chrome_profile_dir:
+        return
+    try:
+        shutil.rmtree(_chrome_profile_dir, ignore_errors=True)
+    except Exception:
+        pass
+    _chrome_profile_dir = None
+
+
+def _safe_quit(driver):
+    if not driver:
+        _cleanup_chrome_profile()
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    _cleanup_chrome_profile()
 
 
 def setup_session(driver):
@@ -2937,13 +3550,19 @@ def run_monitoring_loop(driver):
 
     if TEST_MODE:
         seen_ids = set()
+        known_ids = set()
+        latest_by_id = {}
+        cold_start_pending = False
         print("🧪 DB skipped — running in-memory only\n")
     else:
         try:
-            cold_start = db_is_cold_start()
+            cold_start_pending = db_is_cold_start()
             init_db()
-            seen_ids = get_seen_ids()
-            print(f"📁 DB loaded — {len(seen_ids)} projects on record\n")
+            seen_ids, known_ids, latest_by_id = get_project_history()
+            print(
+                f"📁 DB loaded — {len(seen_ids)} occurrence(s) across "
+                f"{len(known_ids)} project ID(s)\n"
+            )
         except Exception as e:
             send_error_notification(
                 "MONGODB_CONNECTION_FAILURE",
@@ -2953,24 +3572,19 @@ def run_monitoring_loop(driver):
             )
             raise
 
-        if cold_start:
-            print("⚙️  First run detected — seeding existing projects (no emails will be sent)...")
-            seed_projects = scan_for_projects(driver)
-            if seed_projects:
-                bulk_insert_projects(seed_projects, emailed=False)
-                print(
-                    f"✅ Seeded {len(seed_projects)} existing projects. "
-                    "Only NEW posts from now on will trigger emails.\n"
-                )
-                seen_ids = get_seen_ids()
-            else:
-                print("⚠️  Could not seed projects on first run — will try again next cycle.\n")
+        if cold_start_pending:
+            print(
+                "⚙️  First run detected — the first successful scan will be "
+                "seeded without sending project emails.\n"
+            )
 
     last_keepalive = time.time()
     KEEPALIVE_INTERVAL = 1800  # refresh session every 30 minutes
 
-    while True:
+    while not shutdown_event.is_set():
         try:
+            renew_worker_lock()
+            set_monitor_state("scanning")
             _monitor_check_count += 1
             check_count = _monitor_check_count
             print(f"\n{'='*30}")
@@ -2983,7 +3597,9 @@ def run_monitoring_loop(driver):
                 print("  🔁 Session keep-alive: cookies refreshed")
 
             driver.get(Config.PROJECTS_URL)
-            time.sleep(5)
+            interruptible_sleep(5)
+            if shutdown_event.is_set():
+                return "stop"
 
             # If session expired, BTG silently redirects to /login — re-login immediately
             url = (driver.current_url or "").lower()
@@ -3023,11 +3639,46 @@ def run_monitoring_loop(driver):
                     _alert_zero_projects(driver, _zero_project_streak)
                 if ONCE_MODE:
                     return "once"
-                time.sleep(Config.CHECK_INTERVAL)
+                set_monitor_state("sleeping")
+                interruptible_sleep(Config.CHECK_INTERVAL)
                 continue
 
             _zero_project_streak = 0
-            new_projects = filter_new_projects(all_projects, seen_ids)
+            set_monitor_state(
+                "scanning",
+                last_successful_scan=datetime.now(PKT).isoformat(),
+                status="ok",
+            )
+
+            # Never alert on the first run. Keep trying to seed until MongoDB
+            # confirms the initial visible projects were stored successfully.
+            if cold_start_pending and not TEST_MODE:
+                print("⚙️  Seeding first successful scan (project emails suppressed)...")
+                if bulk_insert_projects(all_projects, emailed=False):
+                    seen_ids, known_ids, latest_by_id = get_project_history()
+                    cold_start_pending = False
+                    print(
+                        f"✅ Seeded {len(all_projects)} existing project(s). "
+                        "Only qualifying future posts will trigger emails.\n"
+                    )
+                else:
+                    print(
+                        "⚠️  Initial seed was not confirmed; project emails remain "
+                        "suppressed and seeding will retry next cycle.\n"
+                    )
+                if ONCE_MODE:
+                    print("\n✅ Once mode complete after first-run seed. Exiting.")
+                    return "once"
+                set_monitor_state("sleeping")
+                interruptible_sleep(Config.CHECK_INTERVAL)
+                continue
+
+            new_projects = filter_new_projects(
+                all_projects,
+                seen_ids,
+                known_ids,
+                latest_by_id,
+            )
 
             if TEST_MODE and all_projects and not seen_ids:
                 project = all_projects[0]
@@ -3071,6 +3722,14 @@ def run_monitoring_loop(driver):
                     seen_ids.add(
                         make_dedupe_key(project['id'], project.get('time_posted', ''))
                     )
+                    project_id = project["id"]
+                    known_ids.add(project_id)
+                    posted_date = _parse_posted_date(project.get("time_posted"))
+                    current_latest = latest_by_id.get(project_id)
+                    if posted_date and (
+                        current_latest is None or posted_date > current_latest
+                    ):
+                        latest_by_id[project_id] = posted_date
             else:
                 print("⏳ No new projects this cycle")
 
@@ -3081,7 +3740,8 @@ def run_monitoring_loop(driver):
                 return "once"
 
             print(f"\n⏳ Next check in {Config.CHECK_INTERVAL}s...")
-            time.sleep(Config.CHECK_INTERVAL)
+            set_monitor_state("sleeping")
+            interruptible_sleep(Config.CHECK_INTERVAL)
 
         except KeyboardInterrupt:
             raise
@@ -3097,7 +3757,9 @@ def run_monitoring_loop(driver):
                 traceback_text=traceback_mod.format_exc(),
             )
             _safe_quit(driver)
-            time.sleep(Config.LOGIN_RETRY_INTERVAL)
+            interruptible_sleep(Config.LOGIN_RETRY_INTERVAL)
+            if shutdown_event.is_set():
+                return "stop"
             driver = initialize_driver()
             login_result = setup_session(driver)
             if not login_result.ok:
@@ -3108,16 +3770,30 @@ def run_monitoring_loop(driver):
                 _safe_quit(driver)
                 return "auth_retry"
 
+    return "stop"
+
 
 def main():
+    install_signal_handlers()
+    set_monitor_state("starting")
+    start_health_server()
+
     print("=" * 50)
     print("🚀 BTG Project Monitor")
     if DEBUG_MODE:
         print("   (DEBUG MODE ON — page structure will be printed)")
     print("=" * 50)
+    if is_railway_environment():
+        meta = railway_metadata()
+        print(f"  Railway env : {meta.get('environment') or '(set)'}")
+        print(f"  Railway svc : {meta.get('service') or '(unknown)'}")
+        print(f"  Railway region: {meta.get('region') or '(unknown)'}")
+        print(f"  Railway deploy: {meta.get('deployment_id') or '(unknown)'}")
     print(f"  Account  : {Config.BTG_EMAIL}")
     print(f"  Interval : {Config.CHECK_INTERVAL}s")
     print(f"  Login retry: {Config.LOGIN_RETRY_INTERVAL}s")
+    print(f"  Repost alert gap: > {Config.REPOST_MIN_DAYS} days")
+    print(f"  Preflight: {'enabled' if Config.BTG_PREFLIGHT_ENABLED else 'disabled'}")
     print("  Max age  : disabled (all unseen projects are saved & emailed)")
     print(f"  Recipients: {', '.join(Config.RECIPIENT_EMAILS)}")
     if Config.ERROR_RECIPIENTS:
@@ -3125,20 +3801,65 @@ def main():
     else:
         print("  Error alerts: NOT CONFIGURED (set error_recipent)")
     print(f"  Error cooldown: {Config.ERROR_EMAIL_COOLDOWN_MINUTES} minutes")
+    print(f"  Health : 0.0.0.0:{Config.HEALTH_PORT}/health")
     if Config.BTG_LOGIN_DIAGNOSTIC_MODE:
         print("  Login diagnostic mode: ENABLED (headed browser)")
     print()
+
+    ok, missing = validate_configuration()
+    if not ok:
+        set_monitor_state("degraded", status="degraded")
+        log_event("ERROR", "config_invalid", missing=",".join(missing))
+        send_error_notification(
+            "CONFIGURATION_ERROR",
+            f"Missing required environment variable(s): {', '.join(missing)}",
+            details="Monitor remains alive with /health degraded. Secrets are never printed.",
+            extra_rows=[("Missing variables", ", ".join(missing))],
+        )
+        while not shutdown_event.is_set():
+            interruptible_sleep(300)
+        stop_health_server()
+        return
 
     if TEST_MODE:
         Config.RECIPIENT_EMAILS = ["muhammadammar7747@gmail.com"]
         print("🧪 TEST MODE — MongoDB skipped, 1 test email → muhammadammar7747@gmail.com\n")
 
-    # Single supervisory loop — auth failures wait LOGIN_RETRY_INTERVAL once (no double sleep)
-    while True:
+    while not shutdown_event.is_set():
         driver = None
         try:
+            if not acquire_worker_lock():
+                set_monitor_state("sleeping")
+                log_event("INFO", "worker_standby", message="another replica holds the lock")
+                interruptible_sleep(min(Config.CHECK_INTERVAL, 60))
+                continue
+
+            if Config.BTG_PREFLIGHT_ENABLED:
+                set_monitor_state("preflight_check")
+                preflight = check_btg_auth_preflight()
+                set_monitor_state(
+                    "preflight_check" if preflight.get("ok") else "degraded",
+                    last_preflight=preflight,
+                    status="ok" if preflight.get("ok") else "degraded",
+                )
+                if not preflight.get("ok"):
+                    alert_preflight_failure(preflight)
+                    log_event(
+                        "WARN",
+                        "preflight_blocked_login",
+                        classification=preflight.get("classification"),
+                    )
+                    interruptible_sleep(Config.BTG_PREFLIGHT_FAILURE_RETRY_SECONDS)
+                    continue
+
+            set_monitor_state("logging_in")
             driver = initialize_driver()
             login_result = setup_session(driver)
+            set_monitor_state(
+                "authenticated" if login_result.ok else "degraded",
+                last_login_result=login_result.status,
+                status="ok" if login_result.ok else "degraded",
+            )
             if not login_result.ok:
                 print(f"❌ Failed to establish BTG session ({login_result.status})")
                 print(
@@ -3147,40 +3868,45 @@ def main():
                 )
                 _safe_quit(driver)
                 driver = None
-                time.sleep(Config.LOGIN_RETRY_INTERVAL)
+                interruptible_sleep(Config.LOGIN_RETRY_INTERVAL)
                 continue
 
             driver.get(Config.PROJECTS_URL)
-            time.sleep(4)
+            interruptible_sleep(4)
+            if shutdown_event.is_set():
+                break
 
+            set_monitor_state("scanning")
             outcome = run_monitoring_loop(driver)
             _safe_quit(driver)
             driver = None
+            cleanup_old_evidence()
 
-            if outcome == "once":
+            if outcome == "once" or ONCE_MODE:
                 print("✅ BTG Monitor stopped")
-                return
+                break
             if outcome == "auth_retry":
                 print(
                     f"Authentication unavailable. Next login attempt in "
                     f"{Config.LOGIN_RETRY_INTERVAL} seconds."
                 )
-                time.sleep(Config.LOGIN_RETRY_INTERVAL)
+                interruptible_sleep(Config.LOGIN_RETRY_INTERVAL)
                 continue
 
-            # Unexpected monitoring exit — controlled retry, not "unexpected crash"
             print(
                 f"Monitoring loop ended ({outcome}). "
                 f"Retrying in {Config.LOGIN_RETRY_INTERVAL} seconds..."
             )
-            time.sleep(Config.LOGIN_RETRY_INTERVAL)
+            interruptible_sleep(Config.LOGIN_RETRY_INTERVAL)
 
         except KeyboardInterrupt:
+            request_shutdown(signal.SIGINT, None)
             _safe_quit(driver)
-            raise
+            break
         except Exception as e:
             print(f"\n❌ Unexpected error: {e}")
             traceback_mod.print_exc()
+            set_monitor_state("degraded", status="degraded")
             send_error_notification(
                 "FATAL_MONITOR_EXCEPTION",
                 e,
@@ -3191,7 +3917,13 @@ def main():
             print(
                 f"Retrying after unexpected error in {Config.LOGIN_RETRY_INTERVAL} seconds..."
             )
-            time.sleep(Config.LOGIN_RETRY_INTERVAL)
+            interruptible_sleep(Config.LOGIN_RETRY_INTERVAL)
+
+    set_monitor_state("shutting_down")
+    release_worker_lock()
+    stop_health_server()
+    print("✅ BTG Monitor stopped")
+
 
 
 def run_test_btg_login():
@@ -3219,10 +3951,19 @@ def run_test_btg_login():
         f"{Config.BTG_PAUSE_AFTER_LOGIN_FAILURE and Config.BTG_LOGIN_DIAGNOSTIC_MODE}"
     )
     print(f"  Headless effective: {Config.HEADLESS and not Config.BTG_LOGIN_DIAGNOSTIC_MODE}")
+    print(f"  Preflight enabled: {Config.BTG_PREFLIGHT_ENABLED}")
 
     # Force diagnostic capture for this one-shot command
     Config.BTG_CLEAR_SESSION_ON_START = True
     Config.BTG_CAPTURE_NETWORK_LOGS = True
+
+    if Config.BTG_PREFLIGHT_ENABLED or is_railway_environment():
+        preflight = check_btg_auth_preflight()
+        print("Preflight result:")
+        print(json.dumps(preflight, indent=2, default=str))
+        if not preflight.get("ok"):
+            print("Aborting login because preflight failed.")
+            return 1
 
     driver = None
     try:
@@ -3268,9 +4009,16 @@ def run_test_btg_login():
 
 
 if __name__ == "__main__":
+    if PRINT_RUNTIME_DIAGNOSTICS_MODE:
+        print_runtime_diagnostics()
+        sys.exit(0)
+
     if TEST_ERROR_EMAIL_MODE:
         ok = run_test_error_email()
         sys.exit(0 if ok else 1)
+
+    if TEST_BTG_PREFLIGHT_MODE:
+        sys.exit(run_test_btg_preflight())
 
     if TEST_BTG_LOGIN_MODE:
         code = run_test_btg_login()
@@ -3280,6 +4028,8 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n⏹️  Stopped by user")
+        release_worker_lock()
+        stop_health_server()
     except Exception as fatal:
         print(f"💥 Fatal crash: {fatal}")
         send_error_notification(
@@ -3289,4 +4039,6 @@ if __name__ == "__main__":
             traceback_text=traceback_mod.format_exc(),
             force=True,
         )
+        release_worker_lock()
+        stop_health_server()
         sys.exit(1)

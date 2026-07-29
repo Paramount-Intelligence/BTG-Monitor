@@ -1,52 +1,44 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.12-slim-bookworm
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    TZ=Asia/Karachi \
     CHROME_BIN=/usr/bin/chromium \
     CHROMEDRIVER_PATH=/usr/bin/chromedriver \
-    HEADLESS=True
+    HEADLESS=true \
+    EVIDENCE_DIR=/tmp/btg-evidence
 
-# Install the compatible Chromium and ChromeDriver versions
-# currently available from Debian Bookworm.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         chromium \
         chromium-driver \
-        fonts-liberation \
+        curl \
         ca-certificates \
-        libasound2 \
-        libatk-bridge2.0-0 \
-        libatk1.0-0 \
-        libcairo2 \
-        libcups2 \
-        libdbus-1-3 \
-        libgdk-pixbuf2.0-0 \
-        libgtk-3-0 \
-        libnspr4 \
+        tzdata \
+        fonts-liberation \
+        fonts-noto-core \
         libnss3 \
-        libpango-1.0-0 \
-        libx11-6 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxext6 \
-        libxfixes3 \
-        libxrandr2 \
-        xdg-utils \
-    && echo "Installed Chromium versions:" \
-    && chromium --version \
-    && chromedriver --version \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /tmp/*
+        libgbm1 \
+        libgtk-3-0 \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+    && echo "Installed browser versions:" \
+    && (chromium --version || true) \
+    && (chromedriver --version || true) \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+COPY . .
 
-COPY btg_script.py .
+RUN sed -i 's/\r$//' /app/start.sh \
+    && chmod +x /app/start.sh \
+    && mkdir -p /tmp/btg-evidence
 
-CMD ["python", "-u", "btg_script.py"]
+EXPOSE 8080
+
+CMD ["/app/start.sh"]

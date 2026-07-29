@@ -1,7 +1,13 @@
 .env
 *.env
+!.env.example
 btg_cookies.json
 __pycache__/
 *.pyc
 *.pyo
+*.log
 test_output.txt
+.venv/
+venv/
+btg_script.backup.py
+/tmp/
